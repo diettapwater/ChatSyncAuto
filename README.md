@@ -1,22 +1,123 @@
-# ⚔️ ChatSyncAuto - The AI Influence Companion
-![Version](https://img.shields.io/badge/version-v6.5-blue)
-![License](https://img.shields.io/badge/license-GPLv3-green)
+# ChatSyncAuto — v7.6 Stable Vault Edition
 
-ChatSyncAuto is a powerful, standalone companion application designed for the *Mount & Blade II: Bannerlord* **AI Influence** mod. It acts as an automated memory manager, scene director, and global world editor, preventing your save files from bloating while keeping your AI NPCs perfectly in character.
+A desktop companion app and AI memory manager for the **AI Influence** mod for
+**Mount & Blade II: Bannerlord**. Built in Python with CustomTkinter.
 
-## ✨ Key Features
-* **🤖 Auto Scene Sync:** Silently mirrors conversations to everyone in your immediate vicinity (reading exact Settlement IDs) for seamless group roleplay.
-* **📚 Infinite Saga Archiver:** Automatically tracks message limits and uses AI to condense old chat history into dense, 3rd-person "Lorebook" chapters. NPCs never forget their past!
-* **📬 Smart Mailbox:** Automatically detects courier `[MESSENGER]` and `[LETTER]` events, prevents them from broadcasting to the room, and saves them to a dedicated Mailbox tab with real-world timestamps.
-* **🎬 Director Mode Filter:** Automatically hides Out-of-Character prompts like `(continue)` from syncing to other NPCs.
-* **⏪ Quick Rewind:** Instantly undo bad AI generations and wipe internal C# mod caches with a single click.
-* **🌍 Global World Editor:** Edit `world.txt`, `cultural_traditions.json`, and other global rulesets in a safe, syntax-validated environment. 
+The AI Influence mod gives NPCs AI-driven dialogue written to per-character JSON files.
+ChatSyncAuto watches those files in real-time and handles everything the mod itself
+doesn't — scene awareness, memory compression, mail systems, and world editing.
 
-## 📥 Installation & Usage
-1. Go to the **[Releases](../../releases)** section on the right side of this page.
-2. Download the latest `ChatSyncAuto.exe`.
-3. Run the application alongside Bannerlord.
-4. Click **Browse save_data...** and target your `Modules/AIInfluence/save_data` folder.
+---
 
-## ⚠️ Important Note on Bannerlord Memory
-Because Bannerlord stores chat history in your PC's RAM while playing, any changes made in this editor (like Quick Rewinds, Summaries, or World Edits) require you to **Save and Exit to the Main Menu**, then Reload your save to force the game to read the updated files. Do not click "Speak" before reloading!
+## Features
+
+### Scene Sync
+When a player talks to an NPC, the mod writes that dialogue to the NPC's JSON file.
+ChatSyncAuto mirrors new lines to every other NPC in the same scene — so nearby
+characters stay aware of conversations happening around them.
+
+- Real-time file monitoring via `watchdog`
+- SHA1 deduplication prevents echo loops
+- Settlement ID-based location grouping (auto-adds NPCs who share a location)
+- Smart filtering: skips OOC player prompts (`(continue)` etc.) and letter events
+- Mirror-NPC-only mode and dry run mode for testing
+
+### NPC Profile Editor
+A multi-tab editor for each NPC's JSON file:
+
+| Tab | Contents |
+|-----|----------|
+| Easy Editor | Personality, backstory, speech quirks, known info, secrets |
+| Dialogue Reader | Formatted script view of conversation history |
+| Chat History | Direct editor for the conversation array |
+| Raw JSON | Full file view with syntax validation |
+
+All tabs support live syntax validation and multi-level undo.
+
+### AI Saga Archiver
+When an NPC's conversation history exceeds a configurable threshold, the app sends
+the older messages to an LLM to generate a compressed third-person summary.
+
+- The summary replaces archived messages as a `MEMORY ARCHIVE` entry in the JSON
+- Summaries are also saved to a **Lore Library** as numbered chapters
+- Keeps NPC context windows manageable while preserving narrative continuity
+- Supports: Ollama (local), OpenAI, Groq, OpenRouter, Anthropic
+
+### Mailbox System
+Detects letter and messenger events in NPC dialogue via regex pattern matching:
+
+- Filters `[MESSENGER]` / `[LETTER]` events out of the normal scene sync flow
+- Archives them in a per-NPC mailbox with real-world timestamps
+- Can scan existing campaign files to recover old letters retroactively
+
+### World Events Vault
+Monitors the mod's global JSON files for dynamic events and diplomatic statements:
+
+- Vaults events into a persistent archive automatically
+- Optional AI summarization into a **World Chronicle** lorebook chapter
+
+### World Editor
+Direct editor for global mod configuration files:
+
+- `world.txt`, action rules, event generator rules, kingdom statement rules
+- JSON validation and save/undo on all files
+
+### Scene Management
+Two-panel NPC manager:
+
+- Add/remove characters to the active scene
+- Search by name
+- Scene presets — save and load named NPC groups
+- Location-based auto-grouping by Settlement ID
+- Auto-include the current interlocutor (whoever the player is talking to)
+
+### Other
+- Auto-copy NPC lines to clipboard for pasting into the game
+- Configurable reply wait timers and reply timeout
+- Appearance theming
+- Multi-level file undo system
+- C# mod cache clearing (Quick Rewind)
+
+---
+
+## Requirements
+
+```
+Python 3.10+
+customtkinter
+watchdog
+```
+
+LLM API key required only for the Saga Archiver feature (optional).
+Supported backends: Ollama, OpenAI, Groq, OpenRouter, Anthropic.
+
+---
+
+## Setup
+
+1. Install dependencies:
+   ```bash
+   pip install customtkinter watchdog
+   ```
+
+2. Run the app:
+   ```bash
+   python ChatSyncAuto.py
+   ```
+
+3. Point it at your AI Influence mod's `save_data` folder.
+   The app will auto-detect common Steam and Game Pass install locations.
+
+---
+
+## Mod Compatibility
+
+Designed for the **AI Influence** mod for Mount & Blade II: Bannerlord.
+The mod writes NPC dialogue to JSON files in its `save_data` directory —
+ChatSyncAuto manages those files.
+
+---
+
+## License
+
+GPLv3 — see [LICENSE](LICENSE)
