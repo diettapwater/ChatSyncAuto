@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Memory Bank vector store
+memory_bank_db/
+lore_chroma_db/
+
+# Local config & secrets
+.env
+config.json
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Build / venv
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# OS
+Thumbs.db
+.DS_Store

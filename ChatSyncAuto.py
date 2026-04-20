@@ -87,7 +87,7 @@ def find_save_data(script_dir: Path) -> Optional[Path]:
     return None
 
 # --- App Configuration ---
-APP_TITLE = "ChatSyncAuto - v7.6 Stable Vault Edition"
+APP_TITLE = "ChatSyncAuto - v8.0 Memory Edition"
 DEFAULT_REPLY_WAIT, DEFAULT_REPLY_TIMEOUT, DEFAULT_DEBOUNCE, DEDUP_TAIL_CHECK = 5.0, 60.0, 0.8, 12
 PRESET_FILE = "ChatSyncAuto_presets.json"
 ctk.set_default_color_theme("blue")
@@ -228,9 +228,14 @@ class AutoEngine:
         self.ignore: Dict[Path, Set[str]] = {}
         self.ignore_ttl: Dict[Tuple[Path, str], float] = {}
         self.auto_archived_milestones: Dict[Path, int] = {}
+        self.last_interaction_time: Dict[Path, float] = {}
+        self._memory_injected: Set[str] = set()
+        self._injection_lock = threading.Lock()   # only one NPC injected per conversation-open
+        self._last_inject_time: float = 0.0       # timestamp of last successful injection
 
     def set_files(self, files: List[Path]):
         self.last_len.clear(); self.pending.clear(); self.ignore.clear(); self.ignore_ttl.clear(); self.auto_archived_milestones.clear()
+        self.last_interaction_time.clear(); self._memory_injected.clear()
         for p in files:
             if "ChatSyncSagas" in str(p) or "ChatSyncLetters" in str(p): continue
             d = safe_load_json(p) or {}
@@ -269,6 +274,29 @@ class AutoEngine:
             self.auto_archived_milestones[p] = 0
             last_milestone = 0
 
+        # --- Memory Bank: Talk-click vs Enter-press detection ---
+        last_interaction = d.get("LastInteractionTimeDays", 0.0) or 0.0
+        prev_interaction = self.last_interaction_time.get(p, 0.0)
+        if last_interaction != prev_interaction:
+            self.last_interaction_time[p] = last_interaction
+            # True talk-click: value DROPPED to near-zero (game resets counter on conversation open).
+            # Time passing in-game causes the value to INCREASE — those are not talk-clicks.
+            # Scene loads assigning a fresh value also don't qualify unless prev was non-zero and new is ~0.
+            is_talk_click = (
+                cur_len == prev_len
+                and last_interaction < 0.1       # landed near zero = fresh interaction
+                and prev_interaction >= 0.1      # came from a non-zero value = confirmed drop
+            )
+            if is_talk_click:
+                threading.Thread(
+                    target=self._inject_memories, args=(p, dict(d), npc_plain), daemon=True
+                ).start()
+        if cur_len > prev_len and str(p) in self._memory_injected:
+            # ConversationHistory grew after injection = Enter pressed, clean up
+            threading.Thread(
+                target=self._cleanup_memory_injection, args=(p,), daemon=True
+            ).start()
+
         if self.app.auto_archive_enabled.get():
             try: threshold = int(self.app.auto_archive_threshold_var.get())
             except ValueError: threshold = 200 
@@ -288,7 +316,18 @@ class AutoEngine:
         ignore_set = self.ignore.get(p, set())
         new2 = [e for e in new if entry_hash(e) not in ignore_set]
 
+        # Filter [NPC_TALK] and [OVERHEARD] entries when ignore group chat is on
+        if self.app.ignore_group_chat.get():
+            def _is_group(e):
+                t = e.get("Text", "") if isinstance(e, dict) else str(e)
+                return t.startswith("[NPC_TALK]") or t.startswith("[OVERHEARD]")
+            new2 = [e for e in new2 if not _is_group(e)]
+
         pend = self.pending.get(p)
+        # Discard stale pending entries (> 30s old) — prevents old player lines from firing
+        if pend and (now - pend.started_at) > 30:
+            self.pending.pop(p, None)
+            pend = None
         if pend:
             reply = None
             for idx in range(pend.player_index + 1, len(ch)):
@@ -340,8 +379,27 @@ class AutoEngine:
                     self.app._archive_letter(npc_plain, inc_text)
                 else:
                     self.app.set_interlocutor(npc_plain)
-                    self.app.log(f"[Auto] Incoming line from {npc_plain}.")
-                    self._mirror(interlocutor=npc_plain, entries=[incoming], incoming=True)
+                    # Look back one entry for the preceding player line.
+                    # Handles the case where pending was cleared (e.g. by a refresh)
+                    # between the player line and the NPC reply.
+                    entries_to_mirror = [incoming]
+                    try:
+                        inc_idx = next(i for i, e in enumerate(ch) if entry_hash(e) == entry_hash(incoming))
+                        if inc_idx > 0:
+                            prev_e = ch[inc_idx - 1]
+                            prev_sp = (entry_speaker(prev_e) or "").strip().lower()
+                            if prev_sp == "player":
+                                p_text = prev_e.get("Text", str(prev_e)) if isinstance(prev_e, dict) else str(prev_e)
+                                is_ooc = self.app.smart_filter_prompts.get() and (
+                                    (p_text.strip().startswith("(") and p_text.strip().endswith(")"))
+                                    or "(continue)" in p_text.lower()
+                                )
+                                if not is_ooc:
+                                    entries_to_mirror = [prev_e, incoming]
+                    except StopIteration:
+                        pass
+                    self.app.log(f"[Auto] Incoming line from {npc_plain}. Mirroring {len(entries_to_mirror)} line(s).")
+                    self._mirror(interlocutor=npc_plain, entries=entries_to_mirror, incoming=True)
 
     def _mirror(self, interlocutor: str, entries: List[Any], incoming: bool = False):
         dry = self.app.dry_run.get()
@@ -411,6 +469,84 @@ class AutoEngine:
             return True, True
         return False
 
+    def _inject_memories(self, path: Path, data: dict, npc_plain: str):
+        # Only one NPC gets injected per conversation-open burst (5s window)
+        if not self._injection_lock.acquire(blocking=False):
+            return
+        try:
+            if time.time() - self._last_inject_time < 5.0:
+                return
+            self._last_inject_time = time.time()
+        finally:
+            self._injection_lock.release()
+        try:
+            import memory_bank
+            if not memory_bank.is_available():
+                return
+            # Always index raw turns when ChromaDB is available — regardless of inject toggle
+            convo = data.get("ConversationHistory") or []
+            if convo:
+                memory_bank.index_conversation_history(npc_plain, convo)
+
+            # Injection into CharacterDescription is gated on the toggle
+            if not self.app.memory_bank_enabled.get():
+                return
+
+            loc    = data.get("LocationType", "")
+            mood   = (data.get("EmotionalState") or {}).get("Mood", "")
+            recent = " ".join(
+                (e.get("Description", "") if isinstance(e, dict) else str(e))
+                for e in (data.get("RecentEvents") or [])[:5]
+            )
+            query_text = f"{npc_plain}. {loc}. {mood}. {recent}"
+            memories = memory_bank.query(npc_plain, query_text, n=3)
+            if not memories:
+                return
+            char_desc = data.get("CharacterDescription", "")
+            char_desc = re.sub(r'\n\n\[MEMORY BANK.*$', '', char_desc, flags=re.DOTALL).strip()
+            block = "\n\n[MEMORY BANK — Relevant History]\n" + "\n---\n".join(
+                f"[Ch.{i+1}] {m}" for i, m in enumerate(memories)
+            )
+            data["CharacterDescription"] = char_desc + block
+            fresh = safe_load_json(path)
+            if fresh:
+                fresh["CharacterDescription"] = data["CharacterDescription"]
+                if safe_write_json(path, fresh):
+                    self._memory_injected.add(str(path))
+                    # Store injection state for UI display
+                    self.app._last_injection[npc_plain] = {
+                        "npc": npc_plain,
+                        "query": query_text,
+                        "chunks": memories,
+                        "timestamp": time.time(),
+                    }
+                    self.app.after(0, lambda n=npc_plain: self.app._refresh_memory_tab(n))
+                    self.app.after(0, lambda n=npc_plain, c=len(memories): self.app.log(
+                        f"[Memory Bank] Injected {c} relevant memories into {n}'s context."
+                    ))
+        except Exception as e:
+            self.app.after(0, lambda err=e: self.app.log(f"[Memory Bank] Inject error: {err}"))
+
+    def _cleanup_memory_injection(self, path: Path):
+        try:
+            data = safe_load_json(path)
+            if not data:
+                return
+            char_desc = data.get("CharacterDescription", "")
+            if "[MEMORY BANK" not in char_desc:
+                self._memory_injected.discard(str(path))
+                return
+            data["CharacterDescription"] = re.sub(
+                r'\n\n\[MEMORY BANK.*$', '', char_desc, flags=re.DOTALL
+            ).strip()
+            safe_write_json(path, data)
+            self._memory_injected.discard(str(path))
+            self.app.after(0, lambda s=path.stem: self.app.log(
+                f"[Memory Bank] Cleaned up memory injection for {s}."
+            ))
+        except Exception as e:
+            self.app.after(0, lambda err=e: self.app.log(f"[Memory Bank] Cleanup error: {err}"))
+
 class ChatSyncAutoApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -443,10 +579,18 @@ class ChatSyncAutoApp(ctk.CTk):
 
         self.auto_archive_enabled = ctk.BooleanVar(value=self.presets.get("auto_archive_enabled", False))
         self.auto_archive_threshold_var = ctk.StringVar(value=str(self.presets.get("auto_archive_threshold", 200)))
+        self.memory_bank_enabled = ctk.BooleanVar(value=self.presets.get("memory_bank_enabled", True))
+        self.ignore_group_chat = ctk.BooleanVar(value=self.presets.get("ignore_group_chat", True))
         self.currently_archiving = set()
-        
+        self._memory_counts: Dict[str, int] = {}   # display_name -> chunk count
+        self._last_injection: Dict[str, dict] = {} # plain_name -> {query, chunks, timestamp}
+        self.display_to_plain: Dict[str, str] = {} # display_name -> npc_plain (ChromaDB key)
+        self._mem_tab_after_id = None              # debounce handle for memory tab refresh
+
         self.auto_archive_enabled.trace_add("write", self._save_settings_trigger)
         self.auto_archive_threshold_var.trace_add("write", self._save_settings_trigger)
+        self.memory_bank_enabled.trace_add("write", self._save_settings_trigger)
+        self.ignore_group_chat.trace_add("write", self._save_settings_trigger)
         
         self.currently_editing_path: Optional[Path] = None
         self.current_interlocutor: Optional[str] = None
@@ -494,8 +638,10 @@ class ChatSyncAutoApp(ctk.CTk):
 
     def _save_settings_trigger(self, *args):
         self.presets["auto_archive_enabled"] = self.auto_archive_enabled.get()
+        self.presets["memory_bank_enabled"] = self.memory_bank_enabled.get()
+        self.presets["ignore_group_chat"] = self.ignore_group_chat.get()
         try: self.presets["auto_archive_threshold"] = int(self.auto_archive_threshold_var.get())
-        except ValueError: pass 
+        except ValueError: pass
         self.presets["player_name"] = self.player_name_var.get()
         save_presets(self.presets_path, self.presets)
 
@@ -570,13 +716,149 @@ class ChatSyncAutoApp(ctk.CTk):
 
         self.tabview = ctk.CTkTabview(controls)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+        self.tab_memory = self.tabview.add("Memory")
         self.tab_auto = self.tabview.add("Auto Sync")
         self.tab_adv = self.tabview.add("Advanced")
         self.tab_lore = self.tabview.add("Lore Library")
-        self.tab_events = self.tabview.add("World Events") 
+        self.tab_events = self.tabview.add("World Events")
         self.tab_letters = self.tabview.add("Mailbox")
         self.tab_world = self.tabview.add("World Editor")
         self.tab_app = self.tabview.add("Appearance")
+        self.tabview.set("Memory")
+
+        # --- MEMORY TAB ---
+        # Section A: Last Injection Strip
+        mem_section_a = ctk.CTkFrame(self.tab_memory, fg_color="#0f1f0f", corner_radius=6)
+        mem_section_a.pack(fill="x", padx=6, pady=(6, 3))
+
+        self.mem_inject_header = ctk.CTkLabel(
+            mem_section_a,
+            text="No injection yet",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#4CAF50",
+            anchor="w",
+        )
+        self.mem_inject_header.pack(fill="x", padx=8, pady=(6, 0))
+
+        self.mem_inject_query = ctk.CTkLabel(
+            mem_section_a,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="#666666",
+            anchor="w",
+        )
+        self.mem_inject_query.pack(fill="x", padx=8, pady=(0, 4))
+
+        # Card row for up to 3 chunk previews
+        self.mem_inject_cards_frame = ctk.CTkFrame(mem_section_a, fg_color="transparent")
+        self.mem_inject_cards_frame.pack(fill="x", padx=6, pady=(0, 6))
+
+        self.mem_inject_no_cards = ctk.CTkLabel(
+            self.mem_inject_cards_frame,
+            text="Talk to an NPC to see memory injection results here.",
+            font=ctk.CTkFont(size=10),
+            text_color="#555555",
+        )
+        self.mem_inject_no_cards.pack(anchor="w", padx=4, pady=4)
+
+        # ── Section B: Chunk Browser ─────────────────────────────────────────────
+        mem_section_b = ctk.CTkFrame(self.tab_memory, fg_color="#0f0f1f", corner_radius=6)
+        mem_section_b.pack(fill="both", expand=True, padx=6, pady=(3, 3))
+
+        # Header row
+        mem_b_header = ctk.CTkFrame(mem_section_b, fg_color="transparent")
+        mem_b_header.pack(fill="x", padx=8, pady=(6, 0))
+        ctk.CTkLabel(
+            mem_b_header,
+            text="Memory Store",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#9C27B0",
+            anchor="w",
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            mem_b_header,
+            text="Rebuild All Memories",
+            width=140,
+            height=22,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#4B0082",
+            hover_color="#300052",
+            command=self._rebuild_all_memories,
+        ).pack(side="right")
+
+        # Filter buttons row
+        mem_b_filters = ctk.CTkFrame(mem_section_b, fg_color="transparent")
+        mem_b_filters.pack(fill="x", padx=8, pady=(4, 0))
+
+        self.mem_filter_var = tk.StringVar(value="all")
+
+        self.mem_btn_all = ctk.CTkButton(
+            mem_b_filters, text="All (0)", width=70, height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="#2d1a4a", hover_color="#3d2a5a", text_color="#9C27B0",
+            command=lambda: self._set_chunk_filter("all"),
+        )
+        self.mem_btn_all.pack(side="left", padx=(0, 4))
+
+        self.mem_btn_saga = ctk.CTkButton(
+            mem_b_filters, text="Saga (0)", width=70, height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="#1a1a2e", hover_color="#2a2a4a", text_color="#666666",
+            command=lambda: self._set_chunk_filter("saga"),
+        )
+        self.mem_btn_saga.pack(side="left", padx=(0, 4))
+
+        self.mem_btn_raw = ctk.CTkButton(
+            mem_b_filters, text="Raw (0)", width=70, height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="#1a1a2e", hover_color="#2a2a4a", text_color="#666666",
+            command=lambda: self._set_chunk_filter("raw"),
+        )
+        self.mem_btn_raw.pack(side="left")
+
+        # Scrollable chunk list
+        self.mem_chunk_scroll = ctk.CTkScrollableFrame(
+            mem_section_b, fg_color="#0a0a1a", corner_radius=4
+        )
+        self.mem_chunk_scroll.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # ── Section C: Query Tester ──────────────────────────────────────────────
+        mem_section_c = ctk.CTkFrame(self.tab_memory, fg_color="#1a1a00", corner_radius=6)
+        mem_section_c.pack(fill="x", padx=6, pady=(3, 6))
+
+        mem_c_header = ctk.CTkFrame(mem_section_c, fg_color="transparent")
+        mem_c_header.pack(fill="x", padx=8, pady=(6, 0))
+        ctk.CTkLabel(
+            mem_c_header,
+            text="Query Tester",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#FFC107",
+            anchor="w",
+        ).pack(side="left")
+
+        mem_c_row = ctk.CTkFrame(mem_section_c, fg_color="transparent")
+        mem_c_row.pack(fill="x", padx=8, pady=(4, 6))
+
+        self.mem_query_entry = ctk.CTkEntry(
+            mem_c_row,
+            placeholder_text='Type a situation to test... e.g. "attack on the village"',
+            font=ctk.CTkFont(size=10),
+            height=28,
+        )
+        self.mem_query_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        ctk.CTkButton(
+            mem_c_row,
+            text="Test",
+            width=52,
+            height=28,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#FFC107",
+            hover_color="#e5ac00",
+            text_color="#000000",
+            command=self._run_query_test,
+        ).pack(side="left")
 
         # --- AUTO SYNC TAB ---
         ctk.CTkSwitch(self.tab_auto, text="Enable Auto Scene Sync", variable=self.auto_enabled).pack(anchor="w", padx=10, pady=10)
@@ -586,11 +868,13 @@ class ChatSyncAutoApp(ctk.CTk):
         ctk.CTkCheckBox(self.tab_auto, text="Smart Filter: Ignore Player Prompts & NPC Letters", variable=self.smart_filter_prompts).pack(anchor="w", padx=10, pady=5)
         ctk.CTkCheckBox(self.tab_auto, text="Mirror ONLY NPC Reply (Always Skip Player Line)", variable=self.mirror_npc_only).pack(anchor="w", padx=10, pady=5)
         ctk.CTkCheckBox(self.tab_auto, text="Auto-copy NPC to Clipboard", variable=self.auto_copy_npc).pack(anchor="w", padx=10, pady=5)
-        
+        ctk.CTkCheckBox(self.tab_auto, text="Block Sync from Group Chat ([NPC_TALK] / [OVERHEARD])", variable=self.ignore_group_chat, command=self._save_settings_trigger).pack(anchor="w", padx=10, pady=5)
+
         ctk.CTkLabel(self.tab_auto, text="Automation Limits", font=ctk.CTkFont(weight="bold")).pack(pady=(15, 5))
         arc_frame = ctk.CTkFrame(self.tab_auto, fg_color="transparent")
         arc_frame.pack(fill="x", padx=10)
         ctk.CTkSwitch(arc_frame, text="Enable Auto-Archiving", variable=self.auto_archive_enabled).grid(row=0, column=0, sticky="w", pady=5)
+        ctk.CTkSwitch(arc_frame, text="Inject Relevant Memories on Talk (ChromaDB)", variable=self.memory_bank_enabled, command=self._save_settings_trigger).grid(row=0, column=1, sticky="w", pady=5, padx=20)
         ctk.CTkLabel(arc_frame, text="Trigger at Messages:").grid(row=1, column=0, sticky="w", pady=5)
         ctk.CTkEntry(arc_frame, textvariable=self.auto_archive_threshold_var, width=60).grid(row=1, column=1, sticky="w", padx=10)
         
@@ -1328,6 +1612,34 @@ class ChatSyncAutoApp(ctk.CTk):
             self.after(0, lambda: self.log(f"[Archive] Not enough new messages to archive for {npc_plain}."))
             if is_auto: self.currently_archiving.discard(str(path))
             return
+        # --- Loremaster Archiver hook ---
+        # If LOREMASTER_ARCHIVER=1 is set, offload the job to the archiver daemon
+        # instead of calling the LLM inline. The daemon writes the chapter and
+        # refreshes the RAG index in the background.
+        if os.getenv("LOREMASTER_ARCHIVER", "").strip() == "1":
+            try:
+                import sys as _sys
+                _lm_path = str(Path(__file__).parent)
+                if _lm_path not in _sys.path:
+                    _sys.path.insert(0, _lm_path)
+                from loremaster.archiver import add_job
+                saga_file = self.campaign_dir / "ChatSyncSagas" / f"{npc_plain}.json"
+                existing = 0
+                if saga_file.exists():
+                    try:
+                        _sd = json.loads(saga_file.read_text(encoding="utf-8"))
+                        existing = len(_sd.get("chapters", []))
+                    except Exception:
+                        pass
+                add_job(npc_plain, str(path), to_archive, kept_messages, existing)
+                if is_auto:
+                    self.currently_archiving.discard(str(path))
+                self.after(0, lambda: self.log(
+                    f"[Archive] Job queued for {npc_plain} → Loremaster archiver will process in background."))
+                return
+            except Exception as _e:
+                self.after(0, lambda err=_e: self.log(
+                    f"[Archive] Archiver hook failed ({err}), falling back to inline LLM."))
         prompt = f"You are an expert at creating concise, third-person Lorebooks and Memory Archives for RPG characters. Read the following 'ConversationHistory' and write a dense, third-person summary of the events. Focus on major plot points, promises made, locations visited, injuries, and relationship shifts. Output ONLY valid JSON containing a single array of strings with exactly ONE element containing your summary. Do not include markdown formatting, code blocks, conversational filler, or explanations. Start your response with [ and end with ]. Language MUST be in {self.api_language_var.get()}."
         provider = self.api_provider_var.get()
         url = self.api_url_var.get().strip()
@@ -1355,8 +1667,19 @@ class ChatSyncAutoApp(ctk.CTk):
                 saga_file = saga_dir / f"{npc_plain}.json"
                 saga_data = safe_load_json(saga_file) or {"character": npc_plain, "chapters": []}
                 if "chapters" not in saga_data: saga_data["chapters"] = []
-                saga_data["chapters"].append({"chapter": len(saga_data.get("chapters", [])) + 1, "content": chapter_text})
+                new_chapter_num = len(saga_data.get("chapters", [])) + 1
+                saga_data["chapters"].append({"chapter": new_chapter_num, "content": chapter_text})
                 safe_write_json(saga_file, saga_data)
+                # Always index to ChromaDB regardless of inject toggle
+                try:
+                    import memory_bank
+                    memory_bank.index_chapter(npc_plain, new_chapter_num, chapter_text)
+                    self.after(0, lambda n=npc_plain, c=new_chapter_num: self.log(
+                        f"[Memory Bank] Indexed chapter {c} for {n}."
+                    ))
+                    self.after(0, self._refresh_memory_counts)
+                except Exception as _mbe:
+                    self.after(0, lambda err=_mbe: self.log(f"[Memory Bank] Index error: {err}"))
                 full_archive_string = "System: [MEMORY ARCHIVE]\n\n" + "\n\n".join([f"--- CHAPTER {c['chapter']} ---\n{c['content']}" for c in saga_data["chapters"]])
                 new_history = [full_archive_string] + kept_messages
                 self.after(0, lambda: self._apply_summary(path, new_history, is_auto=is_auto))
@@ -1612,6 +1935,17 @@ class ChatSyncAutoApp(ctk.CTk):
         self.characters = chars
         self.plain_to_path = {normalize_display_name(d): p for d, p in chars}
         self.path_to_plain = {p: normalize_display_name(d) for d, p in chars}
+        # Map display name → npc_plain (the name used in ChromaDB)
+        self.display_to_plain = {}
+        for f in sorted(self.campaign_dir.rglob("*.json")):
+            if "ChatSyncSagas" in str(f) or "ChatSyncLetters" in str(f) or "ChatSyncVaults" in str(f): continue
+            d = safe_load_json(f)
+            if not isinstance(d, dict): continue
+            name = extract_character_name(d, f.stem)
+            rel = f.relative_to(self.campaign_dir).as_posix().rsplit(".", 1)[0]
+            display = f"{name} ({rel})" if name and name.lower() not in f.stem.lower() else rel
+            npc_plain = name or normalize_display_name(f.stem)
+            self.display_to_plain[display] = npc_plain
         valid = {d for d, _ in chars}
         self.scene_members = {d for d in self.scene_members if d in valid}
         self.engine.set_files([p for _, p in chars])
@@ -1622,6 +1956,7 @@ class ChatSyncAutoApp(ctk.CTk):
             self.manual_source_combo.set(names_for_combo[0])
         self.log(f"[Info] Loaded {len(chars)} characters.")
         self._set_status()
+        self._refresh_memory_counts()
 
     def _refresh_preset_combo(self):
         names = list(self.presets.get("scene_presets", {}).keys())
@@ -1670,7 +2005,7 @@ class ChatSyncAutoApp(ctk.CTk):
         target_path = None
         sel = self.all_list.curselection()
         if sel:
-            display_name = self.all_list.get(sel[0]).replace("  [in scene]", "")
+            display_name = self._strip_list_decoration(self.all_list.get(sel[0]))
             target_path = self.plain_to_path.get(normalize_display_name(display_name))
         if not target_path:
             sel_scene = self.scene_list.curselection()
@@ -1744,19 +2079,52 @@ class ChatSyncAutoApp(ctk.CTk):
         widget = event.widget
         sel = widget.curselection()
         if not sel: return
-        display_name = widget.get(sel[0]).replace("  [in scene]", "")
+        display_name = self._strip_list_decoration(widget.get(sel[0]))
         path = self.plain_to_path.get(normalize_display_name(display_name))
         if not path: return
         self.currently_editing_path = path
         self._refresh_json_editor()
+        self._refresh_memory_tab(display_name)
 
     def _rebuild_all_list(self):
         self.all_list.delete(0, tk.END)
         term = self.npc_search_var.get().strip().lower()
-        for display, _ in self.characters:
-            if term and term not in display.lower(): continue
-            if display in self.scene_members: self.all_list.insert(tk.END, f"{display}  [in scene]")
-            else: self.all_list.insert(tk.END, display)
+        for idx, (display, _) in enumerate(self.characters):
+            if term and term not in display.lower():
+                continue
+            count = self._memory_counts.get(display, -1)
+            if count == -1:
+                dot = "○"   # not yet loaded
+                dot_color = "#555555"
+            elif count == 0:
+                dot = "●"
+                dot_color = "#666666"
+            elif count < 10:
+                dot = "●"
+                dot_color = "#FFC107"
+            else:
+                dot = "●"
+                dot_color = "#4CAF50"
+
+            count_str = f"  {count}" if count >= 0 else ""
+            if display in self.scene_members:
+                label = f"{dot} {display}  [scene]{count_str}"
+            else:
+                label = f"{dot} {display}{count_str}"
+
+            self.all_list.insert(tk.END, label)
+            self.all_list.itemconfigure(tk.END, foreground=dot_color)
+
+    @staticmethod
+    def _strip_list_decoration(raw: str) -> str:
+        """Remove dot prefix and scene/count suffixes inserted by _rebuild_all_list."""
+        # Remove leading dot character and space: "● Name  42" -> "Name  42"
+        raw = re.sub(r"^[●○]\s*", "", raw)
+        # Remove [scene] tag
+        raw = raw.replace("  [scene]", "")
+        # Remove trailing chunk count "  42"
+        raw = re.sub(r"\s+\d+$", "", raw)
+        return raw.strip()
 
     def _rebuild_scene_list(self):
         self.scene_list.delete(0, tk.END)
@@ -1765,7 +2133,7 @@ class ChatSyncAutoApp(ctk.CTk):
 
     def _add_selected_to_scene(self):
         for idx in self.all_list.curselection():
-            item = self.all_list.get(idx).replace("  [in scene]", "")
+            item = self._strip_list_decoration(self.all_list.get(idx))
             if item in {x for x, _ in self.characters}: self.scene_members.add(item)
         self._rebuild_all_list()
         self._rebuild_scene_list()
@@ -1795,6 +2163,360 @@ class ChatSyncAutoApp(ctk.CTk):
         talk = self.current_interlocutor or "—"
         self.status_var.set(f"Scene: {count} | Talking to: {talk}")
 
+    def _refresh_memory_counts(self):
+        """Refresh memory chunk counts for all loaded NPCs in a background thread."""
+        display_plain = {d: self.display_to_plain.get(d, d) for d, _ in self.characters}
+        if not display_plain:
+            return
+        # Skip if a count refresh is already running — prevents stacking threads
+        if getattr(self, "_counting_in_progress", False):
+            return
+        self._counting_in_progress = True
+        def _bg():
+            try:
+                import memory_bank
+                if not memory_bank.is_available():
+                    return
+                counts = {display: memory_bank.count_npc(plain) for display, plain in display_plain.items()}
+                self.after(0, lambda c=counts: self._apply_memory_counts(c))
+            except Exception as e:
+                print(f"[MemoryBank] Background count refresh failed: {e}")
+            finally:
+                self._counting_in_progress = False
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _apply_memory_counts(self, counts: dict):
+        """Apply refreshed counts and redraw the NPC list."""
+        self._memory_counts = counts
+        self._rebuild_all_list()
+
+    def _rebuild_all_memories(self):
+        """Backfill raw turns + saga chapters for every loaded NPC into ChromaDB."""
+        if not self.characters:
+            self.log("[Memory Bank] No NPCs loaded — open a save_data folder first.")
+            return
+        self.log(f"[Memory Bank] Rebuilding memories for {len(self.characters)} NPC(s)…")
+
+        def _bg():
+            try:
+                import memory_bank
+                if not memory_bank.is_available():
+                    self.after(0, lambda: self.log("[Memory Bank] ChromaDB not available."))
+                    return
+                indexed = 0
+                for display_name, path in list(self.characters):
+                    data = safe_load_json(Path(path))
+                    if not isinstance(data, dict):
+                        continue
+                    npc_plain = extract_character_name(data, Path(path).stem) or normalize_display_name(Path(path).stem)
+                    # Index raw conversation turns
+                    convo = data.get("ConversationHistory") or []
+                    if convo:
+                        memory_bank.index_conversation_history(npc_plain, convo)
+                    # Index existing saga chapters from ChatSyncSagas JSON
+                    if self.campaign_dir:
+                        saga_file = self.campaign_dir / "ChatSyncSagas" / f"{npc_plain}.json"
+                        if saga_file.exists():
+                            saga_data = safe_load_json(saga_file)
+                            if not isinstance(saga_data, dict):
+                                continue
+                            for ch in saga_data.get("chapters", []):
+                                memory_bank.index_chapter(npc_plain, ch["chapter"], ch["content"])
+                    indexed += 1
+                self.after(0, lambda n=indexed: self.log(
+                    f"[Memory Bank] Rebuild complete — {n} NPC(s) indexed."))
+                self.after(0, self._refresh_memory_counts)
+                self.after(0, self._refresh_memory_tab)
+            except Exception as e:
+                import traceback as _tb
+                tb_str = _tb.format_exc()
+                self.after(0, lambda err=e, tb=tb_str: self.log(f"[Memory Bank] Rebuild error: {err}\n{tb}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _refresh_memory_tab(self, npc_name: str = "") -> None:
+        """Debounced refresh — cancels previous pending refresh before scheduling new one."""
+        if not npc_name:
+            sel = self.all_list.curselection()
+            if sel:
+                raw = self.all_list.get(sel[0])
+                npc_name = self._strip_list_decoration(raw)
+        if not npc_name:
+            return
+        if self._mem_tab_after_id is not None:
+            try:
+                self.after_cancel(self._mem_tab_after_id)
+            except Exception:
+                pass
+        self._mem_tab_after_id = self.after(150, lambda n=npc_name: self._do_refresh_memory_tab(n))
+
+    def _do_refresh_memory_tab(self, npc_name: str) -> None:
+        """Actually refresh — only runs if Memory tab is active."""
+        self._mem_tab_after_id = None
+        try:
+            if self.tabview.get() != "Memory":
+                return
+        except Exception:
+            pass
+        self._update_inject_strip(npc_name)
+        self._populate_chunk_browser(npc_name)
+
+    def _update_inject_strip(self, npc_name: str) -> None:
+        """Update Section A (last injection strip) for the given NPC."""
+        import time as _time
+        data = self._last_injection.get(npc_name)
+        if not data:
+            self.mem_inject_header.configure(text="No injection yet")
+            self.mem_inject_query.configure(text="")
+            for w in self.mem_inject_cards_frame.winfo_children():
+                w.destroy()
+            self.mem_inject_no_cards = ctk.CTkLabel(
+                self.mem_inject_cards_frame,
+                text="Talk to an NPC to see memory injection results here.",
+                font=ctk.CTkFont(size=10),
+                text_color="#555555",
+            )
+            self.mem_inject_no_cards.pack(anchor="w", padx=4, pady=4)
+            return
+        # Header
+        chunks = data.get("chunks", [])
+        elapsed = int((_time.time() - data["timestamp"]) / 60)
+        time_str = f"{elapsed}m ago" if elapsed > 0 else "just now"
+        self.mem_inject_header.configure(
+            text=f"\u2713 Last injection for {npc_name} \u2014 {len(chunks)} chunks \u2014 {time_str}"
+        )
+        # Query preview (truncate to 60 chars)
+        query_preview = data.get("query", "")[:60]
+        self.mem_inject_query.configure(text=f'Query: "{query_preview}"')
+        # Chunk cards
+        for w in self.mem_inject_cards_frame.winfo_children():
+            w.destroy()
+        for chunk_text in chunks[:3]:
+            card = ctk.CTkFrame(
+                self.mem_inject_cards_frame,
+                fg_color="#111111",
+                border_color="#3B8ED0",
+                border_width=1,
+                corner_radius=4,
+            )
+            card.pack(side="left", fill="both", expand=True, padx=3)
+            ctk.CTkLabel(
+                card,
+                text="MEMORY",
+                font=ctk.CTkFont(size=9, weight="bold"),
+                text_color="#3B8ED0",
+                anchor="w",
+            ).pack(fill="x", padx=5, pady=(4, 0))
+            ctk.CTkLabel(
+                card,
+                text=chunk_text[:120],
+                font=ctk.CTkFont(size=10),
+                text_color="#cccccc",
+                anchor="w",
+                wraplength=180,
+                justify="left",
+            ).pack(fill="x", padx=5, pady=(0, 5))
+
+    def _set_chunk_filter(self, filter_val: str) -> None:
+        """Switch chunk browser filter and re-render."""
+        self.mem_filter_var.set(filter_val)
+        # Update button styles
+        active_fg, active_txt = "#2d1a4a", "#9C27B0"
+        inactive_fg, inactive_txt = "#1a1a2e", "#666666"
+        self.mem_btn_all.configure(
+            fg_color=active_fg if filter_val == "all" else inactive_fg,
+            text_color=active_txt if filter_val == "all" else inactive_txt,
+        )
+        self.mem_btn_saga.configure(
+            fg_color=active_fg if filter_val == "saga" else inactive_fg,
+            text_color=active_txt if filter_val == "saga" else inactive_txt,
+        )
+        self.mem_btn_raw.configure(
+            fg_color=active_fg if filter_val == "raw" else inactive_fg,
+            text_color=active_txt if filter_val == "raw" else inactive_txt,
+        )
+        # Re-render with current NPC
+        sel = self.all_list.curselection()
+        if sel:
+            raw = self.all_list.get(sel[0])
+            npc_name = self._strip_list_decoration(raw)
+            self._populate_chunk_browser(npc_name)
+
+    def _populate_chunk_browser(self, npc_name: str) -> None:
+        """Show a loading placeholder, fetch chunks off-thread, render on main thread."""
+        npc_plain = self.display_to_plain.get(npc_name, npc_name)
+        filter_val = self.mem_filter_var.get()
+
+        # Clear and show loading indicator immediately (fast, no DB hit)
+        for w in self.mem_chunk_scroll.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(
+            self.mem_chunk_scroll,
+            text="Loading…",
+            font=ctk.CTkFont(size=10),
+            text_color="#555555",
+        ).pack(anchor="w", padx=4, pady=8)
+
+        def _fetch():
+            import memory_bank
+            try:
+                chunks = memory_bank.get_all_chunks(npc_plain)
+            except Exception:
+                chunks = []
+            self.after(0, lambda: self._render_chunks(chunks, filter_val))
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    _CHUNK_RENDER_LIMIT = 100
+
+    def _render_chunks(self, chunks: list, filter_val: str) -> None:
+        """Render fetched chunks on the main thread (called via after())."""
+        for w in self.mem_chunk_scroll.winfo_children():
+            w.destroy()
+
+        saga_chunks = [c for c in chunks if not c["meta"].get("raw")]
+        raw_chunks  = [c for c in chunks if c["meta"].get("raw")]
+
+        self.mem_btn_all.configure(text=f"All ({len(chunks)})")
+        self.mem_btn_saga.configure(text=f"Saga ({len(saga_chunks)})")
+        self.mem_btn_raw.configure(text=f"Raw ({len(raw_chunks)})")
+
+        if filter_val == "saga":
+            visible = saga_chunks
+        elif filter_val == "raw":
+            visible = raw_chunks
+        else:
+            visible = chunks
+
+        if not visible:
+            ctk.CTkLabel(
+                self.mem_chunk_scroll,
+                text="No memory chunks stored for this NPC yet.",
+                font=ctk.CTkFont(size=10),
+                text_color="#555555",
+            ).pack(anchor="w", padx=4, pady=8)
+            return
+
+        capped = visible[:self._CHUNK_RENDER_LIMIT]
+        for chunk in capped:
+            is_saga = not chunk["meta"].get("raw")
+            tag_color = "#9C27B0" if is_saga else "#3B8ED0"
+            tag_text = f"CH.{chunk['meta'].get('chapter', '?')}" if is_saga else "RAW"
+            preview = chunk["text"][:120].replace("\n", " ")
+            row = ctk.CTkFrame(self.mem_chunk_scroll, fg_color="#111111", corner_radius=3)
+            row.pack(fill="x", pady=2, padx=2)
+            ctk.CTkLabel(
+                row, text=tag_text,
+                font=ctk.CTkFont(size=9, weight="bold"),
+                text_color=tag_color, width=36, anchor="w",
+            ).pack(side="left", padx=(5, 0), pady=4)
+            row_label = ctk.CTkLabel(
+                row, text=preview,
+                font=ctk.CTkFont(size=10), text_color="#aaaaaa",
+                anchor="w", justify="left",
+            )
+            row_label.pack(side="left", fill="x", expand=True, padx=(4, 6), pady=4)
+            full_text = chunk["text"]
+            def make_toggle(lbl, short, full):
+                state = {"expanded": False}
+                def toggle(event=None):
+                    if state["expanded"]:
+                        lbl.configure(text=short, wraplength=0)
+                        state["expanded"] = False
+                    else:
+                        lbl.configure(text=full, wraplength=400)
+                        state["expanded"] = True
+                return toggle
+            toggle_fn = make_toggle(row_label, preview, full_text)
+            row_label.bind("<Button-1>", toggle_fn)
+            row.bind("<Button-1>", toggle_fn)
+
+        if len(visible) > self._CHUNK_RENDER_LIMIT:
+            ctk.CTkLabel(
+                self.mem_chunk_scroll,
+                text=f"… showing {self._CHUNK_RENDER_LIMIT} of {len(visible)} chunks",
+                font=ctk.CTkFont(size=9), text_color="#555555",
+            ).pack(anchor="w", padx=4, pady=4)
+
+    def _run_query_test(self) -> None:
+        """Run a test query against the memory store for the selected NPC."""
+        import memory_bank
+        sel = self.all_list.curselection()
+        if not sel:
+            return
+        npc_name = self._strip_list_decoration(self.all_list.get(sel[0]))
+        npc_plain = self.display_to_plain.get(npc_name, npc_name)
+        query_text = self.mem_query_entry.get().strip()
+        if not query_text:
+            return
+
+        results = memory_bank.query(npc_plain, query_text, n=5)
+
+        # Temporarily replace chunk list with query results
+        for w in self.mem_chunk_scroll.winfo_children():
+            w.destroy()
+
+        if not results:
+            ctk.CTkLabel(
+                self.mem_chunk_scroll,
+                text=f'No memories surfaced for: "{query_text}"',
+                font=ctk.CTkFont(size=10),
+                text_color="#666666",
+            ).pack(anchor="w", padx=4, pady=8)
+            return
+
+        # Header showing this is a test result view
+        ctk.CTkLabel(
+            self.mem_chunk_scroll,
+            text=f'Test results for: "{query_text[:50]}" — click a filter to return',
+            font=ctk.CTkFont(size=10),
+            text_color="#FFC107",
+        ).pack(anchor="w", padx=4, pady=(4, 2))
+
+        for i, chunk_text in enumerate(results):
+            row = ctk.CTkFrame(
+                self.mem_chunk_scroll,
+                fg_color="#111100",
+                corner_radius=3,
+                border_color="#FFC107",
+                border_width=1,
+            )
+            row.pack(fill="x", pady=2, padx=2)
+
+            ctk.CTkLabel(
+                row,
+                text=f"#{i+1}",
+                font=ctk.CTkFont(size=9, weight="bold"),
+                text_color="#FFC107",
+                width=24,
+                anchor="w",
+            ).pack(side="left", padx=(5, 0), pady=4)
+
+            preview = chunk_text[:120].replace("\n", " ")
+            row_label = ctk.CTkLabel(
+                row,
+                text=preview,
+                font=ctk.CTkFont(size=10),
+                text_color="#cccc88",
+                anchor="w",
+                justify="left",
+            )
+            row_label.pack(side="left", fill="x", expand=True, padx=(4, 6), pady=4)
+
+            # Expand on click
+            def make_toggle(lbl, short, full):
+                state = {"expanded": False}
+                def toggle(event=None):
+                    if state["expanded"]:
+                        lbl.configure(text=short, wraplength=0)
+                        state["expanded"] = False
+                    else:
+                        lbl.configure(text=full, wraplength=400)
+                        state["expanded"] = True
+                return toggle
+            row_label.bind("<Button-1>", make_toggle(row_label, preview, chunk_text))
+            row.bind("<Button-1>", make_toggle(row_label, preview, chunk_text))
+
     def set_interlocutor(self, plain: str):
         self.current_interlocutor = plain
         self._set_status()
@@ -1820,7 +2542,6 @@ class ChatSyncAutoApp(ctk.CTk):
     def _push_undo_group(self, desc: str, backups: list[tuple[Path, str]]):
         if not backups: return
         self.undo_stack.append({"desc": desc, "files": backups})
-        if len(self.undo_stack) > self.max_undo: self.undo_stack = self.undo_stack[-self.max_undo:]
         self.undo_btn.configure(state="normal")
 
     def undo_last(self):
