@@ -87,8 +87,10 @@ def find_save_data(script_dir: Path) -> Optional[Path]:
     return None
 
 # --- App Configuration ---
-APP_TITLE = "ChatSyncAuto - v8.0 Memory Edition"
+APP_TITLE = "ChatSyncAuto - v8.3"
 DEFAULT_REPLY_WAIT, DEFAULT_REPLY_TIMEOUT, DEFAULT_DEBOUNCE, DEDUP_TAIL_CHECK = 5.0, 60.0, 0.8, 12
+_MEM_PREAMBLE_START = "\n\n--- PAST MEMORIES (ChatSyncAuto) ---\n"
+_MEM_PREAMBLE_END = "\n--- END PAST MEMORIES ---"
 PRESET_FILE = "ChatSyncAuto_presets.json"
 ctk.set_default_color_theme("blue")
 
@@ -228,14 +230,9 @@ class AutoEngine:
         self.ignore: Dict[Path, Set[str]] = {}
         self.ignore_ttl: Dict[Tuple[Path, str], float] = {}
         self.auto_archived_milestones: Dict[Path, int] = {}
-        self.last_interaction_time: Dict[Path, float] = {}
-        self._memory_injected: Set[str] = set()
-        self._injection_lock = threading.Lock()   # only one NPC injected per conversation-open
-        self._last_inject_time: float = 0.0       # timestamp of last successful injection
 
     def set_files(self, files: List[Path]):
         self.last_len.clear(); self.pending.clear(); self.ignore.clear(); self.ignore_ttl.clear(); self.auto_archived_milestones.clear()
-        self.last_interaction_time.clear(); self._memory_injected.clear()
         for p in files:
             if "ChatSyncSagas" in str(p) or "ChatSyncLetters" in str(p): continue
             d = safe_load_json(p) or {}
@@ -274,28 +271,6 @@ class AutoEngine:
             self.auto_archived_milestones[p] = 0
             last_milestone = 0
 
-        # --- Memory Bank: Talk-click vs Enter-press detection ---
-        last_interaction = d.get("LastInteractionTimeDays", 0.0) or 0.0
-        prev_interaction = self.last_interaction_time.get(p, 0.0)
-        if last_interaction != prev_interaction:
-            self.last_interaction_time[p] = last_interaction
-            # True talk-click: value DROPPED to near-zero (game resets counter on conversation open).
-            # Time passing in-game causes the value to INCREASE — those are not talk-clicks.
-            # Scene loads assigning a fresh value also don't qualify unless prev was non-zero and new is ~0.
-            is_talk_click = (
-                cur_len == prev_len
-                and last_interaction < 0.1       # landed near zero = fresh interaction
-                and prev_interaction >= 0.1      # came from a non-zero value = confirmed drop
-            )
-            if is_talk_click:
-                threading.Thread(
-                    target=self._inject_memories, args=(p, dict(d), npc_plain), daemon=True
-                ).start()
-        if cur_len > prev_len and str(p) in self._memory_injected:
-            # ConversationHistory grew after injection = Enter pressed, clean up
-            threading.Thread(
-                target=self._cleanup_memory_injection, args=(p,), daemon=True
-            ).start()
 
         if self.app.auto_archive_enabled.get():
             try: threshold = int(self.app.auto_archive_threshold_var.get())
@@ -360,6 +335,7 @@ class AutoEngine:
                 self.pending[p] = PendingExchange(p, npc_plain, (cur_len - len(new2)) + i, e, now, now + float(self.app.reply_wait.get()))
                 self.app.set_interlocutor(npc_plain)
                 self.app.log(f"[Auto] Detected Player -> {npc_plain}. Waiting for reply...")
+                self.app._inject_memory_preamble(npc_plain, p)
                 return
 
         if self.app.handle_incoming.get():
@@ -469,83 +445,6 @@ class AutoEngine:
             return True, True
         return False
 
-    def _inject_memories(self, path: Path, data: dict, npc_plain: str):
-        # Only one NPC gets injected per conversation-open burst (5s window)
-        if not self._injection_lock.acquire(blocking=False):
-            return
-        try:
-            if time.time() - self._last_inject_time < 5.0:
-                return
-            self._last_inject_time = time.time()
-        finally:
-            self._injection_lock.release()
-        try:
-            import memory_bank
-            if not memory_bank.is_available():
-                return
-            # Always index raw turns when ChromaDB is available — regardless of inject toggle
-            convo = data.get("ConversationHistory") or []
-            if convo:
-                memory_bank.index_conversation_history(npc_plain, convo)
-
-            # Injection into CharacterDescription is gated on the toggle
-            if not self.app.memory_bank_enabled.get():
-                return
-
-            loc    = data.get("LocationType", "")
-            mood   = (data.get("EmotionalState") or {}).get("Mood", "")
-            recent = " ".join(
-                (e.get("Description", "") if isinstance(e, dict) else str(e))
-                for e in (data.get("RecentEvents") or [])[:5]
-            )
-            query_text = f"{npc_plain}. {loc}. {mood}. {recent}"
-            memories = memory_bank.query(npc_plain, query_text, n=3)
-            if not memories:
-                return
-            char_desc = data.get("CharacterDescription", "")
-            char_desc = re.sub(r'\n\n\[MEMORY BANK.*$', '', char_desc, flags=re.DOTALL).strip()
-            block = "\n\n[MEMORY BANK — Relevant History]\n" + "\n---\n".join(
-                f"[Ch.{i+1}] {m}" for i, m in enumerate(memories)
-            )
-            data["CharacterDescription"] = char_desc + block
-            fresh = safe_load_json(path)
-            if fresh:
-                fresh["CharacterDescription"] = data["CharacterDescription"]
-                if safe_write_json(path, fresh):
-                    self._memory_injected.add(str(path))
-                    # Store injection state for UI display
-                    self.app._last_injection[npc_plain] = {
-                        "npc": npc_plain,
-                        "query": query_text,
-                        "chunks": memories,
-                        "timestamp": time.time(),
-                    }
-                    self.app.after(0, lambda n=npc_plain: self.app._refresh_memory_tab(n))
-                    self.app.after(0, lambda n=npc_plain, c=len(memories): self.app.log(
-                        f"[Memory Bank] Injected {c} relevant memories into {n}'s context."
-                    ))
-        except Exception as e:
-            self.app.after(0, lambda err=e: self.app.log(f"[Memory Bank] Inject error: {err}"))
-
-    def _cleanup_memory_injection(self, path: Path):
-        try:
-            data = safe_load_json(path)
-            if not data:
-                return
-            char_desc = data.get("CharacterDescription", "")
-            if "[MEMORY BANK" not in char_desc:
-                self._memory_injected.discard(str(path))
-                return
-            data["CharacterDescription"] = re.sub(
-                r'\n\n\[MEMORY BANK.*$', '', char_desc, flags=re.DOTALL
-            ).strip()
-            safe_write_json(path, data)
-            self._memory_injected.discard(str(path))
-            self.app.after(0, lambda s=path.stem: self.app.log(
-                f"[Memory Bank] Cleaned up memory injection for {s}."
-            ))
-        except Exception as e:
-            self.app.after(0, lambda err=e: self.app.log(f"[Memory Bank] Cleanup error: {err}"))
 
 class ChatSyncAutoApp(ctk.CTk):
     def __init__(self):
@@ -558,6 +457,7 @@ class ChatSyncAutoApp(ctk.CTk):
 
         self.script_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
         self.save_data_dir: Optional[Path] = None
+        self._thoughts_visible: bool = False
         self.campaign_dir: Optional[Path] = None
         self.characters: List[Tuple[str, Path]] = []
         self.plain_to_path: Dict[str, Path] = {}
@@ -579,16 +479,19 @@ class ChatSyncAutoApp(ctk.CTk):
 
         self.auto_archive_enabled = ctk.BooleanVar(value=self.presets.get("auto_archive_enabled", False))
         self.auto_archive_threshold_var = ctk.StringVar(value=str(self.presets.get("auto_archive_threshold", 200)))
+        self.days_per_year_var = ctk.StringVar(value=str(self.presets.get("days_per_year", 84)))
         self.memory_bank_enabled = ctk.BooleanVar(value=self.presets.get("memory_bank_enabled", True))
         self.ignore_group_chat = ctk.BooleanVar(value=self.presets.get("ignore_group_chat", True))
         self.currently_archiving = set()
         self._memory_counts: Dict[str, int] = {}   # display_name -> chunk count
-        self._last_injection: Dict[str, dict] = {} # plain_name -> {query, chunks, timestamp}
+        self._mem_font_size: int = 10
+        self._current_memory_npc: str = ""         # last NPC shown in Memory tab
         self.display_to_plain: Dict[str, str] = {} # display_name -> npc_plain (ChromaDB key)
         self._mem_tab_after_id = None              # debounce handle for memory tab refresh
 
         self.auto_archive_enabled.trace_add("write", self._save_settings_trigger)
         self.auto_archive_threshold_var.trace_add("write", self._save_settings_trigger)
+        self.days_per_year_var.trace_add("write", self._save_settings_trigger)
         self.memory_bank_enabled.trace_add("write", self._save_settings_trigger)
         self.ignore_group_chat.trace_add("write", self._save_settings_trigger)
         
@@ -641,6 +544,8 @@ class ChatSyncAutoApp(ctk.CTk):
         self.presets["memory_bank_enabled"] = self.memory_bank_enabled.get()
         self.presets["ignore_group_chat"] = self.ignore_group_chat.get()
         try: self.presets["auto_archive_threshold"] = int(self.auto_archive_threshold_var.get())
+        except ValueError: pass
+        try: self.presets["days_per_year"] = int(self.days_per_year_var.get())
         except ValueError: pass
         self.presets["player_name"] = self.player_name_var.get()
         save_presets(self.presets_path, self.presets)
@@ -712,7 +617,7 @@ class ChatSyncAutoApp(ctk.CTk):
         ctk.CTkLabel(npc_mgr, text="Manual Location Sync", font=ctk.CTkFont(weight="bold")).pack(pady=(5, 0))
         loc_frame = ctk.CTkFrame(npc_mgr, fg_color="transparent")
         loc_frame.pack(fill="x", padx=10, pady=(5, 10))
-        ctk.CTkButton(loc_frame, text="Add Everyone Near Selected NPC", command=self._add_local_from_selected).pack(fill="x", expand=True, padx=2)
+        ctk.CTkButton(loc_frame, text="Add Active NPCs Near Selected", command=self._add_local_from_selected).pack(fill="x", expand=True, padx=2)
 
         self.tabview = ctk.CTkTabview(controls)
         self.tabview.pack(fill="both", expand=True, padx=10, pady=(10, 5))
@@ -727,40 +632,6 @@ class ChatSyncAutoApp(ctk.CTk):
         self.tabview.set("Memory")
 
         # --- MEMORY TAB ---
-        # Section A: Last Injection Strip
-        mem_section_a = ctk.CTkFrame(self.tab_memory, fg_color="#0f1f0f", corner_radius=6)
-        mem_section_a.pack(fill="x", padx=6, pady=(6, 3))
-
-        self.mem_inject_header = ctk.CTkLabel(
-            mem_section_a,
-            text="No injection yet",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#4CAF50",
-            anchor="w",
-        )
-        self.mem_inject_header.pack(fill="x", padx=8, pady=(6, 0))
-
-        self.mem_inject_query = ctk.CTkLabel(
-            mem_section_a,
-            text="",
-            font=ctk.CTkFont(size=10),
-            text_color="#666666",
-            anchor="w",
-        )
-        self.mem_inject_query.pack(fill="x", padx=8, pady=(0, 4))
-
-        # Card row for up to 3 chunk previews
-        self.mem_inject_cards_frame = ctk.CTkFrame(mem_section_a, fg_color="transparent")
-        self.mem_inject_cards_frame.pack(fill="x", padx=6, pady=(0, 6))
-
-        self.mem_inject_no_cards = ctk.CTkLabel(
-            self.mem_inject_cards_frame,
-            text="Talk to an NPC to see memory injection results here.",
-            font=ctk.CTkFont(size=10),
-            text_color="#555555",
-        )
-        self.mem_inject_no_cards.pack(anchor="w", padx=4, pady=4)
-
         # ── Section B: Chunk Browser ─────────────────────────────────────────────
         mem_section_b = ctk.CTkFrame(self.tab_memory, fg_color="#0f0f1f", corner_radius=6)
         mem_section_b.pack(fill="both", expand=True, padx=6, pady=(3, 3))
@@ -778,6 +649,17 @@ class ChatSyncAutoApp(ctk.CTk):
 
         ctk.CTkButton(
             mem_b_header,
+            text="Purge All",
+            width=80,
+            height=22,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#6B0000",
+            hover_color="#4a0000",
+            command=self._purge_all_memories,
+        ).pack(side="right", padx=(0, 4))
+
+        ctk.CTkButton(
+            mem_b_header,
             text="Rebuild All Memories",
             width=140,
             height=22,
@@ -786,6 +668,7 @@ class ChatSyncAutoApp(ctk.CTk):
             hover_color="#300052",
             command=self._rebuild_all_memories,
         ).pack(side="right")
+
 
         # Filter buttons row
         mem_b_filters = ctk.CTkFrame(mem_section_b, fg_color="transparent")
@@ -817,48 +700,25 @@ class ChatSyncAutoApp(ctk.CTk):
         )
         self.mem_btn_raw.pack(side="left")
 
+        # Font size controls
+        ctk.CTkButton(
+            mem_b_filters, text="A+", width=32, height=22,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#1a1a2e", hover_color="#2a2a4a", text_color="#aaaaaa",
+            command=self._mem_font_increase,
+        ).pack(side="right")
+        ctk.CTkButton(
+            mem_b_filters, text="A−", width=32, height=22,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#1a1a2e", hover_color="#2a2a4a", text_color="#aaaaaa",
+            command=self._mem_font_decrease,
+        ).pack(side="right", padx=(0, 4))
+
         # Scrollable chunk list
         self.mem_chunk_scroll = ctk.CTkScrollableFrame(
             mem_section_b, fg_color="#0a0a1a", corner_radius=4
         )
         self.mem_chunk_scroll.pack(fill="both", expand=True, padx=6, pady=6)
-
-        # ── Section C: Query Tester ──────────────────────────────────────────────
-        mem_section_c = ctk.CTkFrame(self.tab_memory, fg_color="#1a1a00", corner_radius=6)
-        mem_section_c.pack(fill="x", padx=6, pady=(3, 6))
-
-        mem_c_header = ctk.CTkFrame(mem_section_c, fg_color="transparent")
-        mem_c_header.pack(fill="x", padx=8, pady=(6, 0))
-        ctk.CTkLabel(
-            mem_c_header,
-            text="Query Tester",
-            font=ctk.CTkFont(size=11, weight="bold"),
-            text_color="#FFC107",
-            anchor="w",
-        ).pack(side="left")
-
-        mem_c_row = ctk.CTkFrame(mem_section_c, fg_color="transparent")
-        mem_c_row.pack(fill="x", padx=8, pady=(4, 6))
-
-        self.mem_query_entry = ctk.CTkEntry(
-            mem_c_row,
-            placeholder_text='Type a situation to test... e.g. "attack on the village"',
-            font=ctk.CTkFont(size=10),
-            height=28,
-        )
-        self.mem_query_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
-
-        ctk.CTkButton(
-            mem_c_row,
-            text="Test",
-            width=52,
-            height=28,
-            font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color="#FFC107",
-            hover_color="#e5ac00",
-            text_color="#000000",
-            command=self._run_query_test,
-        ).pack(side="left")
 
         # --- AUTO SYNC TAB ---
         ctk.CTkSwitch(self.tab_auto, text="Enable Auto Scene Sync", variable=self.auto_enabled).pack(anchor="w", padx=10, pady=10)
@@ -874,9 +734,10 @@ class ChatSyncAutoApp(ctk.CTk):
         arc_frame = ctk.CTkFrame(self.tab_auto, fg_color="transparent")
         arc_frame.pack(fill="x", padx=10)
         ctk.CTkSwitch(arc_frame, text="Enable Auto-Archiving", variable=self.auto_archive_enabled).grid(row=0, column=0, sticky="w", pady=5)
-        ctk.CTkSwitch(arc_frame, text="Inject Relevant Memories on Talk (ChromaDB)", variable=self.memory_bank_enabled, command=self._save_settings_trigger).grid(row=0, column=1, sticky="w", pady=5, padx=20)
         ctk.CTkLabel(arc_frame, text="Trigger at Messages:").grid(row=1, column=0, sticky="w", pady=5)
         ctk.CTkEntry(arc_frame, textvariable=self.auto_archive_threshold_var, width=60).grid(row=1, column=1, sticky="w", padx=10)
+        ctk.CTkLabel(arc_frame, text="Days per Year (84=Vanilla, 365=Timelord):").grid(row=2, column=0, sticky="w", pady=5)
+        ctk.CTkEntry(arc_frame, textvariable=self.days_per_year_var, width=60).grid(row=2, column=1, sticky="w", padx=10)
         
         # --- LORE LIBRARY TAB ---
         ctk.CTkLabel(self.tab_lore, text="Saga Memory Archives", font=ctk.CTkFont(weight="bold")).pack(pady=(10, 5))
@@ -1024,6 +885,7 @@ class ChatSyncAutoApp(ctk.CTk):
         self.editor_tabview.pack(fill="both", expand=True, padx=10, pady=(0, 5))
         self.tab_easy = self.editor_tabview.add("Easy Editor")
         self.tab_reader = self.editor_tabview.add("Dialogue Reader")
+        self.tab_saga = self.editor_tabview.add("Saga Archive")
         self.tab_history = self.editor_tabview.add("Chat History")
         self.tab_raw = self.editor_tabview.add("Raw JSON")
 
@@ -1034,21 +896,57 @@ class ChatSyncAutoApp(ctk.CTk):
         ctk.CTkLabel(self.easy_scroll, text="Character Description (Core Personality)", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 2))
         self.easy_char_desc = ctk.CTkTextbox(self.easy_scroll, height=100, wrap="word", undo=True)
         self.easy_char_desc.pack(fill="x", pady=(0, 15))
+        self._lock_scroll(self.easy_char_desc)
         ctk.CTkLabel(self.easy_scroll, text="AI Generated Personality", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 2))
         self.easy_ai_pers = ctk.CTkTextbox(self.easy_scroll, height=100, wrap="word", undo=True)
         self.easy_ai_pers.pack(fill="x", pady=(0, 15))
+        self._lock_scroll(self.easy_ai_pers)
         ctk.CTkLabel(self.easy_scroll, text="AI Generated Backstory", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 2))
         self.easy_ai_back = ctk.CTkTextbox(self.easy_scroll, height=100, wrap="word", undo=True)
         self.easy_ai_back.pack(fill="x", pady=(0, 15))
+        self._lock_scroll(self.easy_ai_back)
         ctk.CTkLabel(self.easy_scroll, text="AI Generated Speech Quirks", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 2))
         self.easy_ai_quirks = ctk.CTkTextbox(self.easy_scroll, height=80, wrap="word", undo=True)
         self.easy_ai_quirks.pack(fill="x", pady=(0, 15))
+        self._lock_scroll(self.easy_ai_quirks)
         ctk.CTkLabel(self.easy_scroll, text="Known Info (Type one piece of info per line)", font=ctk.CTkFont(weight="bold"), text_color="#5CE1E6").pack(anchor="w", pady=(0, 2))
         self.easy_known_info = ctk.CTkTextbox(self.easy_scroll, height=100, wrap="none", undo=True)
         self.easy_known_info.pack(fill="x", pady=(0, 15))
+        self._lock_scroll(self.easy_known_info)
         ctk.CTkLabel(self.easy_scroll, text="Known Secrets (Type one secret per line)", font=ctk.CTkFont(weight="bold"), text_color="#F08080").pack(anchor="w", pady=(0, 2))
         self.easy_known_secrets = ctk.CTkTextbox(self.easy_scroll, height=100, wrap="none", undo=True)
         self.easy_known_secrets.pack(fill="x", pady=(0, 10))
+        self._lock_scroll(self.easy_known_secrets)
+
+        self.btn_thoughts = ctk.CTkButton(
+            self.easy_scroll,
+            text="▶ Internal Thoughts",
+            anchor="w",
+            fg_color="transparent",
+            hover_color="#2a2d2e",
+            text_color=("#9b59b6", "#c39bd3"),
+            command=self._toggle_thoughts,
+        )
+        self.btn_thoughts.pack(fill="x", pady=(5, 2))
+        self.easy_thoughts = ctk.CTkTextbox(self.easy_scroll, height=160, wrap="word")
+        self.easy_thoughts.configure(state="disabled")
+        self.easy_thoughts.pack_forget()
+        self._lock_scroll(self.easy_thoughts)
+
+        self.btn_injected = ctk.CTkButton(
+            self.easy_scroll,
+            text="▶ Injected Memories",
+            anchor="w",
+            fg_color="transparent",
+            hover_color="#2a2d2e",
+            text_color=("#2e86ab", "#5bc8f5"),
+            command=self._toggle_injected,
+        )
+        self.btn_injected.pack(fill="x", pady=(5, 2))
+        self.easy_injected = ctk.CTkTextbox(self.easy_scroll, height=220, wrap="word")
+        self.easy_injected.configure(state="disabled")
+        self.easy_injected.pack_forget()
+        self._lock_scroll(self.easy_injected)
 
         # --- DIALOGUE READER TAB ---
         ctk.CTkLabel(self.tab_reader, text="Read-Only Script View", font=ctk.CTkFont(weight="bold"), text_color="gray").pack(pady=(0, 2))
@@ -1061,6 +959,22 @@ class ChatSyncAutoApp(ctk.CTk):
         self.reader_text.tag_config("lore_text", foreground="#DDA0DD", justify="center")
         self.reader_text.configure(state="disabled")
 
+        # --- SAGA ARCHIVE TAB ---
+        saga_btn_frame = ctk.CTkFrame(self.tab_saga, fg_color="transparent")
+        saga_btn_frame.pack(fill="x", pady=(0, 4))
+        ctk.CTkButton(saga_btn_frame, text="Export Saga", width=120,
+                      fg_color="#2a5298", hover_color="#1a3a7a",
+                      command=self._export_saga).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(saga_btn_frame, text="Import Saga", width=120,
+                      fg_color="#2e7d32", hover_color="#1b5e20",
+                      command=self._import_saga).pack(side="left")
+        self.saga_reader_text = ctk.CTkTextbox(self.tab_saga, wrap="word")
+        self.saga_reader_text.pack(fill="both", expand=True, pady=(0, 5))
+        self.saga_reader_text.tag_config("chapter_header", foreground="#FFD700", justify="center")
+        self.saga_reader_text.tag_config("chapter_body", foreground="#D8C8F0", justify="left")
+        self.saga_reader_text.tag_config("no_archive", foreground="#808080", justify="center")
+        self.saga_reader_text.configure(state="disabled")
+
         # --- CHAT HISTORY TAB ---
         self.history_syntax_var = ctk.StringVar(value="✅ Valid Array")
         self.history_syntax_label = ctk.CTkLabel(self.tab_history, textvariable=self.history_syntax_var, text_color="#228B22", font=ctk.CTkFont(weight="bold"))
@@ -1068,6 +982,22 @@ class ChatSyncAutoApp(ctk.CTk):
         self.history_text = ctk.CTkTextbox(self.tab_history, wrap="none", undo=True)
         self.history_text.pack(fill="both", expand=True, pady=(0, 5))
         self.history_text.bind("<KeyRelease>", self._check_history_syntax)
+
+        # --- NARRATOR INPUT STRIP ---
+        narrator_frame = ctk.CTkFrame(self.tab_history, fg_color="#1a1a2e", corner_radius=6)
+        narrator_frame.pack(fill="x", padx=2, pady=(0, 4))
+        ctk.CTkLabel(
+            narrator_frame, text="Narrator:", font=ctk.CTkFont(size=10, weight="bold"),
+            text_color="#9C27B0", width=65, anchor="w",
+        ).pack(side="left", padx=(8, 4), pady=6)
+        self.narrator_input = ctk.CTkTextbox(narrator_frame, height=52, wrap="word", fg_color="#0d0d1a")
+        self.narrator_input.pack(side="left", fill="x", expand=True, padx=(0, 6), pady=5)
+        ctk.CTkButton(
+            narrator_frame, text="Insert", width=60, height=40,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#4B0082", hover_color="#300052",
+            command=self._insert_narrator_message,
+        ).pack(side="right", padx=(0, 8), pady=5)
 
         # --- RAW JSON TAB ---
         self.json_syntax_var = ctk.StringVar(value="✅ Valid JSON")
@@ -1085,6 +1015,15 @@ class ChatSyncAutoApp(ctk.CTk):
         ctk.CTkButton(editor_btn_frame, text="Toggle Wrap", width=80, fg_color="#4682B4", hover_color="#4169E1", command=self._toggle_json_wrap).pack(side="left", padx=2)
         self.btn_save_json = ctk.CTkButton(editor_btn_frame, text="Save Changes", fg_color="#228B22", hover_color="#006400", command=self._save_json_editor)
         self.btn_save_json.pack(side="right", padx=2)
+
+    @staticmethod
+    def _lock_scroll(widget):
+        """Prevent mousewheel events on a CTkTextbox from bubbling to a parent CTkScrollableFrame."""
+        inner = widget._textbox
+        def _handler(event):
+            inner.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+        inner.bind("<MouseWheel>", _handler)
 
     def _toggle_world_wrap(self):
         current = self.world_textbox._textbox.cget("wrap")
@@ -1167,40 +1106,144 @@ class ChatSyncAutoApp(ctk.CTk):
         self.log(f"[Archive] Sending Letters for {char_name} to AI for summarization...")
         threading.Thread(target=self._process_global_archive, args=(data["letters"], [], f"Letters_{char_name}"), daemon=True).start()
 
+    def _build_world_chronicle_input(self, dyn_events: list, dip_stmts: list) -> list:
+        """Return a list of richly-formatted text sections sorted by campaign_days.
+        Each section describes one event or diplomatic action. Sections are separated
+        so the caller can batch them into API chunks of a safe size."""
+        items = []
+        for ev in (dyn_events or []):
+            if not isinstance(ev, dict): continue
+            day = ev.get("creation_campaign_days") or ev.get("campaign_days") or 0
+            items.append(("event", int(day), ev))
+        for stmt in (dip_stmts or []):
+            if not isinstance(stmt, dict): continue
+            day = stmt.get("campaign_days") or 0
+            items.append(("stmt", int(day), stmt))
+        items.sort(key=lambda x: x[1])
+
+        sections = []
+        try: dpy = max(1, int(self.days_per_year_var.get()))
+        except (ValueError, AttributeError): dpy = 84
+        for kind, day, obj in items:
+            year = day // dpy if day else 0
+            doy  = day % dpy  if day else 0
+            date_str = f"Year {year}, Day {doy}" if day else "Unknown Date"
+            if kind == "event":
+                lines = [
+                    f"[WORLD EVENT — {date_str}]",
+                    f"Title: {obj.get('title', 'Untitled')}",
+                    f"Type: {obj.get('type', 'unknown').capitalize()}  |  Importance: {obj.get('importance', '?')}/10",
+                    f"Kingdoms: {', '.join(obj.get('kingdoms_involved') or [])}",
+                    "",
+                    obj.get("description", ""),
+                ]
+                for ks in (obj.get("kingdom_statements") or []):
+                    if not isinstance(ks, dict): continue
+                    kingdom = str(ks.get("kingdom_id", "?")).replace("_", " ").title()
+                    tone    = ks.get("tone", "")
+                    speech  = ks.get("statement", "")
+                    if speech:
+                        lines.append(f'\n  [{kingdom} — {tone}]: "{speech}"')
+                sections.append("\n".join(lines))
+            else:
+                kingdom = str(obj.get("kingdom_id", "?")).replace("_", " ").title()
+                target  = str(obj.get("target_kingdom_id", "?")).replace("_", " ").title()
+                action  = obj.get("action", "Unknown")
+                speech  = obj.get("statement_text", "")
+                reason  = obj.get("reason", "")
+                lines   = [f"[DIPLOMATIC ACTION — {date_str}]", f"{kingdom} → {target}: {action}"]
+                if speech: lines.append(f'Statement: "{speech}"')
+                if reason: lines.append(f"Reason: {reason}")
+                sections.append("\n".join(lines))
+        return sections
+
     def _process_global_archive(self, data_1, data_2, filename_stem):
-        combined = {"Data1": data_1, "Data2": data_2}
-        prompt = f"You are a master historian for an RPG. Read the following JSON events/statements and summarize them into a beautiful, dense, third-person historical chronicle chapter. Focus on major plot points, wars, threats, and character actions. Output ONLY valid JSON containing a single array of strings with exactly ONE element containing your summary. Do not include markdown formatting or explanations. Start with [ and end with ]. Language MUST be in {self.api_language_var.get()}."
+        sections = self._build_world_chronicle_input(data_1, data_2)
+        if not sections:
+            self.after(0, lambda: self.log("[Archive] No events to chronicle."))
+            return
+
+        lang = self.api_language_var.get()
+        prompt = (
+            "You are the Grand Chronicler of Calradia, keeper of the World Chronicle — a sweeping record of the "
+            "realm's wars, diplomacy, betrayals, and turning-point moments.\n\n"
+            "You will receive a chronological log of world events and diplomatic actions. "
+            "Write a rich, immersive third-person chronicle chapter in flowing historical prose. "
+            "Group closely-related events together. Convey the weight and consequence of each decision. "
+            "Quote or paraphrase the most powerful diplomatic speeches. "
+            "Name kingdoms and rulers as they appear in the data. "
+            "Reference dates as 'Year X, Day Y of the campaign'.\n\n"
+            "REQUIREMENTS:\n"
+            "- Flowing narrative prose — NOT a list, NOT bullet points\n"
+            "- At least 5 substantial paragraphs; more for larger batches\n"
+            "- Capture drama, scale, and political intrigue\n"
+            "- Language: " + lang + "\n\n"
+            "Output ONLY valid JSON: a single array with ONE string element containing the full chronicle. "
+            "No markdown, no extra keys. Start with [ and end with ]."
+        )
+
+        # Batch sections so each API call stays within ~14 000 chars
+        BATCH_CHARS = 14000
+        batches, cur = [], ""
+        for sec in sections:
+            block = ("\n\n---\n\n" if cur else "") + sec
+            if len(cur) + len(block) > BATCH_CHARS and cur:
+                batches.append(cur)
+                cur = sec
+            else:
+                cur += block
+        if cur:
+            batches.append(cur)
+
         provider = self.api_provider_var.get()
-        url = self.api_url_var.get().strip()
-        model = self.api_model_var.get().strip()
-        api_key = self.api_key_var.get().strip()
-        headers = {'Content-Type': 'application/json'}
-        if provider == "Anthropic (Claude)":
-            headers['x-api-key'] = api_key
-            headers['anthropic-version'] = '2023-06-01'
-            payload = {"model": model, "max_tokens": 4000, "system": prompt, "messages": [{"role": "user", "content": json.dumps(combined)[:12000]}]}
-        else:
-            if api_key: headers['Authorization'] = f'Bearer {api_key}'
-            payload = {"model": model, "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(combined)[:12000]}], "stream": False}
-        try:
-            req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
-            with urllib.request.urlopen(req, timeout=120) as response:
-                res_json = json.loads(response.read())
-                content = res_json["content"][0]["text"].strip() if provider == "Anthropic (Claude)" else res_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                s_idx, e_idx = content.find('['), content.rfind(']')
-                if s_idx != -1 and e_idx != -1: content = content[s_idx:e_idx+1]
-                archive_array = json.loads(content)
-                saga_dir = self.campaign_dir / "ChatSyncSagas"
-                saga_dir.mkdir(exist_ok=True)
-                saga_file = saga_dir / f"{filename_stem}.json"
-                saga_data = safe_load_json(saga_file) or {"character": filename_stem, "chapters": []}
-                if "chapters" not in saga_data: saga_data["chapters"] = []
-                saga_data["chapters"].append({"chapter": len(saga_data.get("chapters", [])) + 1, "content": archive_array[0]})
-                safe_write_json(saga_file, saga_data)
-                self.after(0, lambda: self.log(f"[Archive] Successfully created Lorebook Chapter for {filename_stem}!"))
-                self.after(0, self._rebuild_lore_library)
-        except Exception as e:
-            self.after(0, lambda err=e: self.log(f"[Archive] API Error: {err}"))
+        url      = self.api_url_var.get().strip()
+        model    = self.api_model_var.get().strip()
+        api_key  = self.api_key_var.get().strip()
+
+        saga_dir  = self.campaign_dir / "ChatSyncSagas"
+        saga_dir.mkdir(exist_ok=True)
+        saga_file = saga_dir / f"{filename_stem}.json"
+        saga_data = safe_load_json(saga_file) or {"character": filename_stem, "chapters": []}
+        if "chapters" not in saga_data: saga_data["chapters"] = []
+
+        chapters_added = 0
+        for batch_text in batches:
+            try:
+                headers = {'Content-Type': 'application/json'}
+                if provider == "Anthropic (Claude)":
+                    headers['x-api-key'] = api_key
+                    headers['anthropic-version'] = '2023-06-01'
+                    payload = {"model": model, "max_tokens": 4000, "system": prompt,
+                               "messages": [{"role": "user", "content": batch_text}]}
+                else:
+                    if api_key: headers['Authorization'] = f'Bearer {api_key}'
+                    payload = {"model": model, "stream": False,
+                               "messages": [{"role": "system", "content": prompt},
+                                            {"role": "user", "content": batch_text}]}
+                req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+                with urllib.request.urlopen(req, timeout=120) as response:
+                    res_json = json.loads(response.read())
+                    content  = (res_json["content"][0]["text"].strip()
+                                if provider == "Anthropic (Claude)"
+                                else res_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip())
+                    s_idx, e_idx = content.find('['), content.rfind(']')
+                    if s_idx != -1 and e_idx != -1: content = content[s_idx:e_idx+1]
+                    try:
+                        archive_array = json.loads(content)
+                        chapter_content = archive_array[0]
+                    except (json.JSONDecodeError, IndexError):
+                        chapter_content = content.lstrip('[').rstrip(']').strip().strip('"').strip()
+                    saga_data["chapters"].append({"chapter": len(saga_data["chapters"]) + 1, "content": chapter_content})
+                    chapters_added += 1
+            except Exception as e:
+                self.after(0, lambda err=e: self.log(f"[Archive] API Error: {err}"))
+                break
+
+        if chapters_added > 0:
+            safe_write_json(saga_file, saga_data)
+            msg = f"[Archive] World Chronicle: {chapters_added} chapter(s) added to {filename_stem}!"
+            self.after(0, lambda m=msg: self.log(m))
+            self.after(0, self._rebuild_lore_library)
 
     def _rebuild_world_events_list(self, *args):
         self.events_listbox.delete(0, tk.END)
@@ -1321,9 +1364,40 @@ class ChatSyncAutoApp(ctk.CTk):
         except json.JSONDecodeError as e:
             messagebox.showerror("JSON Error", f"Invalid JSON:\n\n{e}")
 
+    def _insert_narrator_message(self):
+        text = self.narrator_input.get("1.0", "end").strip()
+        if not text:
+            return
+        if not self.currently_editing_path:
+            self.log("[Narrator] No NPC selected.")
+            return
+        data = safe_load_json(Path(self.currently_editing_path))
+        if not isinstance(data, dict):
+            self.log("[Narrator] Could not load NPC data.")
+            return
+        entry = f"System: ({text})"
+        history = data.get("ConversationHistory") or []
+        history.append(entry)
+        data["ConversationHistory"] = history
+        self._clear_mod_caches(data)
+        if safe_write_json(Path(self.currently_editing_path), data):
+            self._write_sync_trigger(Path(self.currently_editing_path))
+            self.narrator_input.delete("1.0", "end")
+            self._refresh_json_editor()
+            npc_name = Path(self.currently_editing_path).stem
+            self.log(f"[Narrator] Inserted system message into {npc_name}'s history.")
+
     def _clear_mod_caches(self, data: dict):
         data["LastAIResponseJson"] = None
         data["LastDynamicResponse"] = None
+
+    def _write_sync_trigger(self, npc_path: Path):
+        if not self.save_data_dir: return
+        try:
+            trigger = self.save_data_dir / "_chatsynco_sync.txt"
+            trigger.write_text(str(npc_path), encoding="utf-8")
+        except Exception as e:
+            self.log(f"[ChatSyncAuto] Sync trigger write failed: {e}")
 
     def _undo_last_ai_reply(self):
         if not self.currently_editing_path: return
@@ -1339,6 +1413,7 @@ class ChatSyncAutoApp(ctk.CTk):
         if safe_write_json(self.currently_editing_path, data):
             self._push_undo_group(f"Undo Last AI Reply for {self.currently_editing_path.stem}", [(self.currently_editing_path, old_text)])
             self.log(f"[Quick Rewind] Deleted last AI reply and cleared caches for {self.currently_editing_path.stem}.")
+            self._write_sync_trigger(self.currently_editing_path)
             self._refresh_json_editor()
 
     def _undo_last_exchange(self):
@@ -1356,6 +1431,7 @@ class ChatSyncAutoApp(ctk.CTk):
         if safe_write_json(self.currently_editing_path, data):
             self._push_undo_group(f"Undo Last Exchange for {self.currently_editing_path.stem}", [(self.currently_editing_path, old_text)])
             self.log(f"[Quick Rewind] Deleted last exchange (Player + AI) and cleared caches for {self.currently_editing_path.stem}.")
+            self._write_sync_trigger(self.currently_editing_path)
             self._refresh_json_editor()
 
     def _update_save_button_state(self, *args):
@@ -1363,7 +1439,7 @@ class ChatSyncAutoApp(ctk.CTk):
         if active_tab == "Easy Editor": self.btn_save_json.configure(state="normal")
         elif active_tab == "Chat History": self._check_history_syntax()
         elif active_tab == "Raw JSON": self._check_json_syntax()
-        elif active_tab == "Dialogue Reader": self.btn_save_json.configure(state="disabled")
+        elif active_tab in ("Dialogue Reader", "Saga Archive"): self.btn_save_json.configure(state="disabled")
 
     def _check_json_syntax(self, event=None):
         raw_text = self.json_text.get("1.0", tk.END).strip()
@@ -1431,62 +1507,124 @@ class ChatSyncAutoApp(ctk.CTk):
 
     def _refresh_json_editor(self):
         if not self.currently_editing_path: return
-        data = safe_load_json(self.currently_editing_path)
+        path = self.currently_editing_path
+        self._thoughts_visible = False
+        self.btn_thoughts.configure(text="▶ Internal Thoughts")
+        self.easy_thoughts.pack_forget()
+        self._injected_visible = False
+        self.btn_injected.configure(text="▶ Injected Memories")
+        self.easy_injected.pack_forget()
         widgets = [self.json_text, self.history_text, self.easy_char_desc, self.easy_ai_pers, self.easy_ai_back, self.easy_ai_quirks, self.easy_known_info, self.easy_known_secrets]
         for w in widgets:
             w.configure(undo=False, state="normal")
             w.delete("1.0", tk.END)
         self.reader_text.configure(state="normal")
         self.reader_text.delete("1.0", tk.END)
-        hero_name = self.player_name_var.get().strip() or "Player"
-        if data:
-            self.json_text.insert(tk.END, json.dumps(data, indent=2, ensure_ascii=False))
-            ch = data.get("ConversationHistory", [])
-            self.history_text.insert(tk.END, json.dumps(ch, indent=2, ensure_ascii=False))
-            self.json_msg_count_var.set(f"Total Messages: {len(ch)}")
-            reader_args = []
-            for entry in ch:
-                if isinstance(entry, str):
-                    if "System: [MEMORY ARCHIVE]" in entry: reader_args.extend((f"\n{'='*50}\n📚 {entry}\n{'='*50}\n\n", "lore_text"))
-                    else:
-                        parts = entry.split(":", 1)
-                        if len(parts) == 2:
-                            sp, tx = parts[0].strip(), parts[1].strip()
-                            if sp.lower() == "player": reader_args.extend((f"{hero_name} 👤\n", "player_name", f"{tx}\n\n", "player_text"))
-                            else: reader_args.extend((f"🗣️ {sp}\n", "npc_name", f"{tx}\n\n", "npc_text"))
-                        else: reader_args.extend((f"{entry}\n\n", "npc_text"))
-                elif isinstance(entry, dict):
-                    sp = entry.get("Speaker", entry.get("speaker", "Unknown"))
-                    tx = entry.get("Text", entry.get("text", ""))
-                    if sp.lower() == "player": reader_args.extend((f"{hero_name} 👤\n", "player_name", f"{tx}\n\n", "player_text"))
-                    else: reader_args.extend((f"🗣️ {sp}\n", "npc_name", f"{tx}\n\n", "npc_text"))
-            if reader_args: self.reader_text._textbox.insert(tk.END, *reader_args)
-            self.easy_char_desc.insert(tk.END, data.get("CharacterDescription") or "")
-            self.easy_ai_pers.insert(tk.END, data.get("AIGeneratedPersonality") or "")
-            self.easy_ai_back.insert(tk.END, data.get("AIGeneratedBackstory") or "")
-            self.easy_ai_quirks.insert(tk.END, data.get("AIGeneratedSpeechQuirks") or "")
-            info_arr = data.get("KnownInfo", [])
-            if isinstance(info_arr, list): self.easy_known_info.insert(tk.END, "\n".join([str(i) for i in info_arr]))
-            secrets_arr = data.get("KnownSecrets", [])
-            if isinstance(secrets_arr, list): self.easy_known_secrets.insert(tk.END, "\n".join([str(s) for s in secrets_arr]))
-            self.json_syntax_var.set("✅ Valid JSON")
-            self.json_syntax_label.configure(text_color="#228B22")
-            self.history_syntax_var.set("✅ Valid History Array")
-            self.history_syntax_label.configure(text_color="#228B22")
-            self.reader_text.see(tk.END)
-            self.history_text.see(tk.END)
-            self.json_text.see(tk.END)
-        else: 
-            self.json_msg_count_var.set("Total Messages: 0")
-            self.json_syntax_var.set("✅ Valid JSON")
-            self.history_syntax_var.set("✅ Valid Array")
-            self.reader_text.insert(tk.END, "No chat history found.")
-        self.reader_text.configure(state="disabled")
-        for w in widgets:
-            w.configure(undo=True)
-            try: w._textbox.edit_reset()
-            except Exception: pass
-        self._update_save_button_state()
+
+        def _bg():
+            data = safe_load_json(path)
+            self.after(0, lambda: _populate(data))
+
+        def _populate(data):
+            if path != self.currently_editing_path:
+                return  # user clicked another NPC before this loaded
+            hero_name = self.player_name_var.get().strip() or "Player"
+            if data:
+                self.json_text.insert(tk.END, json.dumps(data, indent=2, ensure_ascii=False))
+                ch = data.get("ConversationHistory", [])
+                self.history_text.insert(tk.END, json.dumps(ch, indent=2, ensure_ascii=False))
+                self.json_msg_count_var.set(f"Total Messages: {len(ch)}")
+                reader_args = []
+                for entry in ch:
+                    if isinstance(entry, str):
+                        if "System: [MEMORY ARCHIVE]" in entry: reader_args.extend((f"\n{'='*50}\n📚 {entry}\n{'='*50}\n\n", "lore_text"))
+                        else:
+                            parts = entry.split(":", 1)
+                            if len(parts) == 2:
+                                sp, tx = parts[0].strip(), parts[1].strip()
+                                if sp.lower() == "player": reader_args.extend((f"{hero_name} 👤\n", "player_name", f"{tx}\n\n", "player_text"))
+                                else: reader_args.extend((f"🗣️ {sp}\n", "npc_name", f"{tx}\n\n", "npc_text"))
+                            else: reader_args.extend((f"{entry}\n\n", "npc_text"))
+                    elif isinstance(entry, dict):
+                        sp = entry.get("Speaker", entry.get("speaker", "Unknown"))
+                        tx = entry.get("Text", entry.get("text", ""))
+                        if sp.lower() == "player": reader_args.extend((f"{hero_name} 👤\n", "player_name", f"{tx}\n\n", "player_text"))
+                        else: reader_args.extend((f"🗣️ {sp}\n", "npc_name", f"{tx}\n\n", "npc_text"))
+                if reader_args: self.reader_text._textbox.insert(tk.END, *reader_args)
+                self.easy_char_desc.insert(tk.END, data.get("CharacterDescription") or "")
+                self.easy_ai_pers.insert(tk.END, data.get("AIGeneratedPersonality") or "")
+                self.easy_ai_back.insert(tk.END, data.get("AIGeneratedBackstory") or "")
+                self.easy_ai_quirks.insert(tk.END, data.get("AIGeneratedSpeechQuirks") or "")
+                info_arr = data.get("KnownInfo", [])
+                if isinstance(info_arr, list): self.easy_known_info.insert(tk.END, "\n".join([str(i) for i in info_arr]))
+                secrets_arr = data.get("KnownSecrets", [])
+                if isinstance(secrets_arr, list): self.easy_known_secrets.insert(tk.END, "\n".join([str(s) for s in secrets_arr]))
+                last_ai_raw = data.get("LastAIResponseJson")
+                thoughts_text = "No internal thoughts recorded yet."
+                if last_ai_raw:
+                    try:
+                        inner = json.loads(last_ai_raw)
+                        thoughts_text = inner.get("internal_thoughts") or "No internal thoughts recorded yet."
+                    except (json.JSONDecodeError, TypeError):
+                        thoughts_text = "Could not parse internal thoughts."
+                self.easy_thoughts.configure(state="normal")
+                self.easy_thoughts.delete("1.0", tk.END)
+                self.easy_thoughts.insert(tk.END, thoughts_text)
+                self.easy_thoughts.configure(state="disabled")
+                backstory_raw = data.get("AIGeneratedBackstory") or ""
+                inj_s = backstory_raw.find(_MEM_PREAMBLE_START)
+                if inj_s != -1:
+                    inj_e = backstory_raw.find(_MEM_PREAMBLE_END, inj_s)
+                    injected_text = backstory_raw[inj_s + len(_MEM_PREAMBLE_START):inj_e].strip() if inj_e != -1 else backstory_raw[inj_s + len(_MEM_PREAMBLE_START):].strip()
+                else:
+                    injected_text = "No memories injected yet."
+                self.easy_injected.configure(state="normal")
+                self.easy_injected.delete("1.0", tk.END)
+                self.easy_injected.insert(tk.END, injected_text)
+                self.easy_injected.configure(state="disabled")
+                self.json_syntax_var.set("✅ Valid JSON")
+                self.json_syntax_label.configure(text_color="#228B22")
+                self.history_syntax_var.set("✅ Valid History Array")
+                self.history_syntax_label.configure(text_color="#228B22")
+                self.reader_text.see(tk.END)
+                self.history_text.see(tk.END)
+                self.json_text.see(tk.END)
+            else:
+                self.json_msg_count_var.set("Total Messages: 0")
+                self.json_syntax_var.set("✅ Valid JSON")
+                self.history_syntax_var.set("✅ Valid Array")
+                self.reader_text.insert(tk.END, "No chat history found.")
+                self.easy_thoughts.configure(state="normal")
+                self.easy_thoughts.delete("1.0", tk.END)
+                self.easy_thoughts.insert(tk.END, "No internal thoughts recorded yet.")
+                self.easy_thoughts.configure(state="disabled")
+            self.reader_text.configure(state="disabled")
+            for w in widgets:
+                w.configure(undo=True)
+                try: w._textbox.edit_reset()
+                except Exception: pass
+            self._refresh_saga_reader(data)
+            self._update_save_button_state()
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _refresh_saga_reader(self, npc_data=None):
+        self.saga_reader_text.configure(state="normal")
+        self.saga_reader_text.delete("1.0", tk.END)
+        saga_data = None
+        if self.currently_editing_path and self.campaign_dir:
+            data = npc_data if npc_data is not None else safe_load_json(self.currently_editing_path)
+            npc_plain = extract_character_name(data or {}, self.currently_editing_path.stem) or normalize_display_name(self.currently_editing_path.stem)
+            saga_file = self.campaign_dir / "ChatSyncSagas" / f"{npc_plain}.json"
+            saga_data = safe_load_json(saga_file) if saga_file.exists() else None
+        if saga_data and saga_data.get("chapters"):
+            for ch in saga_data["chapters"]:
+                self.saga_reader_text.insert(tk.END, f"\n── Chapter {ch['chapter']} ──\n\n", "chapter_header")
+                self.saga_reader_text.insert(tk.END, ch.get("content", "").strip() + "\n", "chapter_body")
+            self.saga_reader_text.see("1.0")
+        else:
+            self.saga_reader_text.insert(tk.END, "\n\nNo archived chapters yet.\n\nOnce this NPC's conversation history reaches the archive threshold, compressed chapters will appear here.", "no_archive")
+        self.saga_reader_text.configure(state="disabled")
 
     def _save_json_editor(self):
         if not self.currently_editing_path: return
@@ -1505,6 +1643,7 @@ class ChatSyncAutoApp(ctk.CTk):
                 if safe_write_json(self.currently_editing_path, data):
                     self._push_undo_group(f"Manual JSON edit of {self.currently_editing_path.stem}", [(self.currently_editing_path, old_text)])
                     self.log(f"[Editor] Saved raw JSON changes to {self.currently_editing_path.stem}")
+                    self._write_sync_trigger(self.currently_editing_path)
                     self._refresh_json_editor() 
             except json.JSONDecodeError as e: messagebox.showerror("JSON Error", f"Invalid JSON:\n\n{e}")
         elif active_tab == "Chat History":
@@ -1522,6 +1661,7 @@ class ChatSyncAutoApp(ctk.CTk):
                 if safe_write_json(self.currently_editing_path, data):
                     self._push_undo_group(f"History Edit of {self.currently_editing_path.stem}", [(self.currently_editing_path, old_text)])
                     self.log(f"[Editor] Saved isolated chat history for {self.currently_editing_path.stem}")
+                    self._write_sync_trigger(self.currently_editing_path)
                     self._refresh_json_editor()
             except Exception as e: messagebox.showerror("JSON Error", f"Invalid History JSON:\n\n{e}")
         elif active_tab == "Easy Editor":
@@ -1660,8 +1800,12 @@ class ChatSyncAutoApp(ctk.CTk):
                 content = res_json["content"][0]["text"].strip() if provider == "Anthropic (Claude)" else res_json.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 s_idx, e_idx = content.find('['), content.rfind(']')
                 if s_idx != -1 and e_idx != -1: content = content[s_idx:e_idx+1]
-                archive_array = json.loads(content)
-                chapter_text = archive_array[0].replace("System: [MEMORY ARCHIVE]", "").strip()
+                try:
+                    archive_array = json.loads(content)
+                    chapter_text = archive_array[0]
+                except (json.JSONDecodeError, IndexError):
+                    chapter_text = content.lstrip('[').rstrip(']').strip().strip('"').strip()
+                chapter_text = chapter_text.replace("System: [MEMORY ARCHIVE]", "").strip()
                 saga_dir = self.campaign_dir / "ChatSyncSagas"
                 saga_dir.mkdir(exist_ok=True)
                 saga_file = saga_dir / f"{npc_plain}.json"
@@ -1670,6 +1814,24 @@ class ChatSyncAutoApp(ctk.CTk):
                 new_chapter_num = len(saga_data.get("chapters", [])) + 1
                 saga_data["chapters"].append({"chapter": new_chapter_num, "content": chapter_text})
                 safe_write_json(saga_file, saga_data)
+                # Save verbatim conversation log before the trim
+                try:
+                    log_dir = self.campaign_dir / "ChatSyncHistory"
+                    log_dir.mkdir(exist_ok=True)
+                    log_file = log_dir / f"{npc_plain}_chapter_{new_chapter_num}.txt"
+                    hero = self.player_name_var.get().strip() or "Player"
+                    lines = [f"=== {npc_plain} — Chapter {new_chapter_num} ===\n"]
+                    for entry in to_archive:
+                        if isinstance(entry, str):
+                            parts = entry.split(":", 1)
+                            if len(parts) == 2:
+                                sp = parts[0].strip()
+                                lines.append(f"{hero if sp.lower() == 'player' else sp}:\n{parts[1].strip()}\n")
+                            else:
+                                lines.append(entry + "\n")
+                    log_file.write_text("\n".join(lines), encoding="utf-8")
+                except Exception as _le:
+                    self.after(0, lambda err=_le: self.log(f"[Archive] Log write failed: {err}"))
                 # Always index to ChromaDB regardless of inject toggle
                 try:
                     import memory_bank
@@ -1680,8 +1842,7 @@ class ChatSyncAutoApp(ctk.CTk):
                     self.after(0, self._refresh_memory_counts)
                 except Exception as _mbe:
                     self.after(0, lambda err=_mbe: self.log(f"[Memory Bank] Index error: {err}"))
-                full_archive_string = "System: [MEMORY ARCHIVE]\n\n" + "\n\n".join([f"--- CHAPTER {c['chapter']} ---\n{c['content']}" for c in saga_data["chapters"]])
-                new_history = [full_archive_string] + kept_messages
+                new_history = kept_messages
                 self.after(0, lambda: self._apply_summary(path, new_history, is_auto=is_auto))
                 self.after(0, self._rebuild_lore_library)
         except Exception as e:
@@ -1694,9 +1855,13 @@ class ChatSyncAutoApp(ctk.CTk):
         if data:
             old_text = path.read_text(encoding="utf-8")
             data["ConversationHistory"] = new_history
+            self._clear_mod_caches(data)
             if safe_write_json(path, data):
                 self._push_undo_group(f"AI Saga Archive of {path.stem}", [(path, old_text)])
-                msg = f"🔔 [AUTO-ARCHIVE COMPLETE] {path.stem} saved to Lore Library! RESTART GAME TO LOAD." if is_auto else f"[Archive] Successfully compressed context for {path.stem}!"
+                self._write_sync_trigger(path)
+                _ap_plain = extract_character_name(data, path.stem) or normalize_display_name(path.stem)
+                self._inject_memory_preamble(_ap_plain, path)
+                msg = f"🔔 [AUTO-ARCHIVE COMPLETE] {path.stem} saved to Lore Library!" if is_auto else f"[Archive] Successfully compressed context for {path.stem}!"
                 if is_auto: self.currently_archiving.discard(str(path))
                 self.log(msg)
                 if self.currently_editing_path and self.currently_editing_path.resolve() == path.resolve(): self._refresh_json_editor()
@@ -1776,6 +1941,105 @@ class ChatSyncAutoApp(ctk.CTk):
             self.mail_textbox.insert(tk.END, f"--- Sent: {letter_data.get('timestamp')} ---\n\n{letter_data['content']}")
             self.mail_textbox.configure(state="disabled")
         except (IndexError, ValueError): pass
+
+    def _export_saga(self):
+        if not self.campaign_dir:
+            self.log("[Saga] Select a campaign folder first.")
+            return
+        sel = self.all_list.curselection()
+        if not sel:
+            self.log("[Saga] Select an NPC first.")
+            return
+        display = self._strip_list_decoration(self.all_list.get(sel[0]))
+        npc_plain = self.display_to_plain.get(display, display)
+        saga_file = self.campaign_dir / "ChatSyncSagas" / f"{npc_plain}.json"
+        if not saga_file.exists():
+            self.log(f"[Saga] No saga found for {npc_plain}.")
+            return
+        saga_data = safe_load_json(saga_file)
+        if not saga_data or not saga_data.get("chapters"):
+            self.log(f"[Saga] {npc_plain} has no chapters to export.")
+            return
+        out = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=f"{npc_plain}_saga.json",
+            filetypes=[("ChatSyncAuto Saga", "*.json"), ("All files", "*.*")],
+            title="Export Saga",
+        )
+        if not out:
+            return
+        export_data = {
+            "chatsyncauto_saga_export": True,
+            "source_character": npc_plain,
+            "chapter_count": len(saga_data["chapters"]),
+            "chapters": saga_data["chapters"],
+        }
+        if safe_write_json(Path(out), export_data):
+            self.log(f"[Saga] Exported {len(saga_data['chapters'])} chapter(s) from {npc_plain} → {Path(out).name}")
+        else:
+            self.log("[Saga] Export failed.")
+
+    def _import_saga(self):
+        if not self.campaign_dir:
+            self.log("[Saga] Select a campaign folder first.")
+            return
+        sel = self.all_list.curselection()
+        if not sel:
+            self.log("[Saga] Select a target NPC in the list first.")
+            return
+        display = self._strip_list_decoration(self.all_list.get(sel[0]))
+        npc_plain = self.display_to_plain.get(display, display)
+        src = filedialog.askopenfilename(
+            filetypes=[("ChatSyncAuto Saga", "*.json"), ("All files", "*.*")],
+            title=f"Import Saga → {npc_plain}",
+        )
+        if not src:
+            return
+        import_data = safe_load_json(Path(src))
+        if not import_data or not import_data.get("chapters"):
+            self.log("[Saga] Invalid file — no chapters found.")
+            return
+        saga_file = self.campaign_dir / "ChatSyncSagas" / f"{npc_plain}.json"
+        existing = safe_load_json(saga_file) or {"character": npc_plain, "chapters": []}
+        if "chapters" not in existing:
+            existing["chapters"] = []
+        existing_hashes = {
+            hashlib.md5(ch.get("content", "").encode()).hexdigest()
+            for ch in existing["chapters"]
+        }
+        new_contents = []
+        for ch in import_data["chapters"]:
+            h = hashlib.md5(ch.get("content", "").encode()).hexdigest()
+            if h not in existing_hashes:
+                existing_hashes.add(h)
+                new_contents.append(ch.get("content", ""))
+        if not new_contents:
+            self.log("[Saga] Nothing new to import — all chapters already present.")
+            return
+        start_num = len(existing["chapters"]) + 1
+        for i, content in enumerate(new_contents):
+            existing["chapters"].append({"chapter": start_num + i, "content": content})
+        existing["character"] = npc_plain
+        if not safe_write_json(saga_file, existing):
+            self.log("[Saga] Failed to write merged saga.")
+            return
+        added = len(new_contents)
+        source_name = import_data.get("source_character", Path(src).stem)
+        self.log(f"[Saga] Imported {added} chapter(s) from {source_name} into {npc_plain}.")
+
+        def _bg_index():
+            try:
+                import memory_bank
+                if memory_bank.is_available():
+                    for ch in existing["chapters"][start_num - 1:]:
+                        memory_bank.index_chapter(npc_plain, ch["chapter"], ch["content"])
+                    self.after(0, lambda: self.log(f"[Saga] ChromaDB indexed {added} chapter(s) for {npc_plain}."))
+            except Exception as e:
+                self.after(0, lambda err=e: self.log(f"[Saga] ChromaDB index error: {err}"))
+            self.after(0, self._rebuild_lore_library)
+            self.after(0, self._refresh_saga_reader)
+
+        threading.Thread(target=_bg_index, daemon=True).start()
 
     def _rebuild_lore_library(self):
         self.lore_char_list.delete(0, tk.END)
@@ -2077,6 +2341,14 @@ class ChatSyncAutoApp(ctk.CTk):
 
     def _on_listbox_select(self, event):
         widget = event.widget
+        # Debounce — <<ListboxSelect>> fires on both press and release; collapse to one
+        if getattr(self, '_listbox_after_id', None):
+            try: self.after_cancel(self._listbox_after_id)
+            except Exception: pass
+        self._listbox_after_id = self.after(50, lambda w=widget: self._do_listbox_select(w))
+
+    def _do_listbox_select(self, widget):
+        self._listbox_after_id = None
         sel = widget.curselection()
         if not sel: return
         display_name = self._strip_list_decoration(widget.get(sel[0]))
@@ -2190,6 +2462,7 @@ class ChatSyncAutoApp(ctk.CTk):
         self._memory_counts = counts
         self._rebuild_all_list()
 
+
     def _rebuild_all_memories(self):
         """Backfill raw turns + saga chapters for every loaded NPC into ChromaDB."""
         if not self.characters:
@@ -2201,7 +2474,8 @@ class ChatSyncAutoApp(ctk.CTk):
             try:
                 import memory_bank
                 if not memory_bank.is_available():
-                    self.after(0, lambda: self.log("[Memory Bank] ChromaDB not available."))
+                    err = memory_bank.get_last_error() or "chromadb not importable — is it installed in this Python environment?"
+                    self.after(0, lambda e=err: self.log(f"[Memory Bank] ChromaDB not available:\n{e}"))
                     return
                 indexed = 0
                 for display_name, path in list(self.characters):
@@ -2227,10 +2501,93 @@ class ChatSyncAutoApp(ctk.CTk):
                     f"[Memory Bank] Rebuild complete — {n} NPC(s) indexed."))
                 self.after(0, self._refresh_memory_counts)
                 self.after(0, self._refresh_memory_tab)
+                for _dn, _ps in list(self.characters):
+                    _rd = safe_load_json(Path(_ps))
+                    if isinstance(_rd, dict):
+                        _rp = extract_character_name(_rd, Path(_ps).stem) or normalize_display_name(Path(_ps).stem)
+                        self._do_inject(_rp, Path(_ps))
             except Exception as e:
                 import traceback as _tb
                 tb_str = _tb.format_exc()
                 self.after(0, lambda err=e, tb=tb_str: self.log(f"[Memory Bank] Rebuild error: {err}\n{tb}"))
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _inject_memory_preamble(self, npc_plain: str, path: Path):
+        """Proactively write top ChromaDB memories into AIGeneratedBackstory.
+
+        Called on NPC select, post-archive, and post-rebuild.
+        Never on talk-click — by the time ChatSyncAuto detects the file change,
+        AI Influence has already dispatched the LLM call with the old context.
+        60-second per-NPC cooldown prevents spam from repeated listbox events.
+        """
+        if not hasattr(self, '_inject_cooldowns'):
+            self._inject_cooldowns: Dict[str, float] = {}
+        if time.time() - self._inject_cooldowns.get(npc_plain, 0) < 60:
+            return
+        self._inject_cooldowns[npc_plain] = time.time()
+        threading.Thread(target=self._do_inject, args=(npc_plain, path), daemon=True).start()
+
+    def _do_inject(self, npc_plain: str, path: Path):
+        """Inner injection logic — safe to call from any background thread."""
+        try:
+            import memory_bank
+            if not memory_bank.is_available():
+                return
+            if memory_bank.count_npc(npc_plain) == 0:
+                return
+            chunks = memory_bank.query(
+                npc_plain,
+                "important events memories relationships history backstory personality",
+                n=5
+            )
+            if not chunks:
+                return
+            data = safe_load_json(path)
+            if not isinstance(data, dict):
+                return
+            backstory = data.get("AIGeneratedBackstory") or ""
+            start = backstory.find(_MEM_PREAMBLE_START)
+            if start != -1:
+                end = backstory.find(_MEM_PREAMBLE_END, start)
+                if end != -1:
+                    backstory = backstory[:start] + backstory[end + len(_MEM_PREAMBLE_END):]
+            backstory = backstory.rstrip()
+            block = _MEM_PREAMBLE_START + "\n\n".join(c.strip() for c in chunks if c.strip()) + _MEM_PREAMBLE_END
+            data["AIGeneratedBackstory"] = backstory + block
+            if safe_write_json(path, data):
+                block_content = "\n\n".join(c.strip() for c in chunks if c.strip())
+                self.after(0, lambda n=npc_plain, c=len(chunks): self.log(
+                    f"[Memory] Injected {c} chunk(s) into {n}'s backstory."
+                ))
+                self.after(0, lambda bc=block_content: self._update_injected_display(bc))
+        except Exception as exc:
+            self.after(0, lambda e=exc: self.log(f"[Memory] Preamble inject failed: {e}"))
+
+    def _purge_all_memories(self):
+        """Wipe the entire ChromaDB memory store after confirmation."""
+        if not messagebox.askyesno(
+            "Purge All Memories",
+            "This will permanently delete ALL memories for every NPC.\n\nAre you sure?",
+        ):
+            return
+
+        def _bg():
+            try:
+                import memory_bank
+                if not memory_bank.is_available():
+                    err = memory_bank.get_last_error() or "chromadb not importable."
+                    self.after(0, lambda e=err: self.log(f"[Memory Bank] ChromaDB not available:\n{e}"))
+                    return
+                ok = memory_bank.clear_all()
+                if ok:
+                    self.after(0, lambda: self.log("[Memory Bank] Purge complete — all memories deleted."))
+                else:
+                    self.after(0, lambda: self.log("[Memory Bank] Purge failed — see console for details."))
+                self.after(0, self._refresh_memory_counts)
+                self.after(0, self._refresh_memory_tab)
+            except Exception as e:
+                self.after(0, lambda err=e: self.log(f"[Memory Bank] Purge error: {err}"))
 
         threading.Thread(target=_bg, daemon=True).start()
 
@@ -2239,8 +2596,9 @@ class ChatSyncAutoApp(ctk.CTk):
         if not npc_name:
             sel = self.all_list.curselection()
             if sel:
-                raw = self.all_list.get(sel[0])
-                npc_name = self._strip_list_decoration(raw)
+                npc_name = self._strip_list_decoration(self.all_list.get(sel[0]))
+        if not npc_name:
+            npc_name = self._current_memory_npc
         if not npc_name:
             return
         if self._mem_tab_after_id is not None:
@@ -2258,64 +2616,17 @@ class ChatSyncAutoApp(ctk.CTk):
                 return
         except Exception:
             pass
-        self._update_inject_strip(npc_name)
+        self._current_memory_npc = npc_name
         self._populate_chunk_browser(npc_name)
 
-    def _update_inject_strip(self, npc_name: str) -> None:
-        """Update Section A (last injection strip) for the given NPC."""
-        import time as _time
-        data = self._last_injection.get(npc_name)
-        if not data:
-            self.mem_inject_header.configure(text="No injection yet")
-            self.mem_inject_query.configure(text="")
-            for w in self.mem_inject_cards_frame.winfo_children():
-                w.destroy()
-            self.mem_inject_no_cards = ctk.CTkLabel(
-                self.mem_inject_cards_frame,
-                text="Talk to an NPC to see memory injection results here.",
-                font=ctk.CTkFont(size=10),
-                text_color="#555555",
-            )
-            self.mem_inject_no_cards.pack(anchor="w", padx=4, pady=4)
-            return
-        # Header
-        chunks = data.get("chunks", [])
-        elapsed = int((_time.time() - data["timestamp"]) / 60)
-        time_str = f"{elapsed}m ago" if elapsed > 0 else "just now"
-        self.mem_inject_header.configure(
-            text=f"\u2713 Last injection for {npc_name} \u2014 {len(chunks)} chunks \u2014 {time_str}"
-        )
-        # Query preview (truncate to 60 chars)
-        query_preview = data.get("query", "")[:60]
-        self.mem_inject_query.configure(text=f'Query: "{query_preview}"')
-        # Chunk cards
-        for w in self.mem_inject_cards_frame.winfo_children():
-            w.destroy()
-        for chunk_text in chunks[:3]:
-            card = ctk.CTkFrame(
-                self.mem_inject_cards_frame,
-                fg_color="#111111",
-                border_color="#3B8ED0",
-                border_width=1,
-                corner_radius=4,
-            )
-            card.pack(side="left", fill="both", expand=True, padx=3)
-            ctk.CTkLabel(
-                card,
-                text="MEMORY",
-                font=ctk.CTkFont(size=9, weight="bold"),
-                text_color="#3B8ED0",
-                anchor="w",
-            ).pack(fill="x", padx=5, pady=(4, 0))
-            ctk.CTkLabel(
-                card,
-                text=chunk_text[:120],
-                font=ctk.CTkFont(size=10),
-                text_color="#cccccc",
-                anchor="w",
-                wraplength=180,
-                justify="left",
-            ).pack(fill="x", padx=5, pady=(0, 5))
+
+    def _mem_font_increase(self):
+        self._mem_font_size = min(24, self._mem_font_size + 1)
+        self._refresh_memory_tab()
+
+    def _mem_font_decrease(self):
+        self._mem_font_size = max(7, self._mem_font_size - 1)
+        self._refresh_memory_tab()
 
     def _set_chunk_filter(self, filter_val: str) -> None:
         """Switch chunk browser filter and re-render."""
@@ -2336,10 +2647,13 @@ class ChatSyncAutoApp(ctk.CTk):
             text_color=active_txt if filter_val == "raw" else inactive_txt,
         )
         # Re-render with current NPC
+        npc_name = ""
         sel = self.all_list.curselection()
         if sel:
-            raw = self.all_list.get(sel[0])
-            npc_name = self._strip_list_decoration(raw)
+            npc_name = self._strip_list_decoration(self.all_list.get(sel[0]))
+        if not npc_name:
+            npc_name = self._current_memory_npc
+        if npc_name:
             self._populate_chunk_browser(npc_name)
 
     def _populate_chunk_browser(self, npc_name: str) -> None:
@@ -2397,6 +2711,7 @@ class ChatSyncAutoApp(ctk.CTk):
             ).pack(anchor="w", padx=4, pady=8)
             return
 
+        fs = self._mem_font_size
         capped = visible[:self._CHUNK_RENDER_LIMIT]
         for chunk in capped:
             is_saga = not chunk["meta"].get("raw")
@@ -2407,12 +2722,12 @@ class ChatSyncAutoApp(ctk.CTk):
             row.pack(fill="x", pady=2, padx=2)
             ctk.CTkLabel(
                 row, text=tag_text,
-                font=ctk.CTkFont(size=9, weight="bold"),
+                font=ctk.CTkFont(size=max(8, fs - 1), weight="bold"),
                 text_color=tag_color, width=36, anchor="w",
             ).pack(side="left", padx=(5, 0), pady=4)
             row_label = ctk.CTkLabel(
                 row, text=preview,
-                font=ctk.CTkFont(size=10), text_color="#aaaaaa",
+                font=ctk.CTkFont(size=fs), text_color="#aaaaaa",
                 anchor="w", justify="left",
             )
             row_label.pack(side="left", fill="x", expand=True, padx=(4, 6), pady=4)
@@ -2438,84 +2753,29 @@ class ChatSyncAutoApp(ctk.CTk):
                 font=ctk.CTkFont(size=9), text_color="#555555",
             ).pack(anchor="w", padx=4, pady=4)
 
-    def _run_query_test(self) -> None:
-        """Run a test query against the memory store for the selected NPC."""
-        import memory_bank
-        sel = self.all_list.curselection()
-        if not sel:
-            return
-        npc_name = self._strip_list_decoration(self.all_list.get(sel[0]))
-        npc_plain = self.display_to_plain.get(npc_name, npc_name)
-        query_text = self.mem_query_entry.get().strip()
-        if not query_text:
-            return
+    def _toggle_thoughts(self):
+        self._thoughts_visible = not self._thoughts_visible
+        if self._thoughts_visible:
+            self.btn_thoughts.configure(text="▼ Internal Thoughts")
+            self.easy_thoughts.pack(fill="x", pady=(0, 10), after=self.btn_thoughts)
+        else:
+            self.btn_thoughts.configure(text="▶ Internal Thoughts")
+            self.easy_thoughts.pack_forget()
 
-        results = memory_bank.query(npc_plain, query_text, n=5)
+    def _toggle_injected(self):
+        self._injected_visible = not self._injected_visible
+        if self._injected_visible:
+            self.btn_injected.configure(text="▼ Injected Memories")
+            self.easy_injected.pack(fill="x", pady=(0, 10), after=self.btn_injected)
+        else:
+            self.btn_injected.configure(text="▶ Injected Memories")
+            self.easy_injected.pack_forget()
 
-        # Temporarily replace chunk list with query results
-        for w in self.mem_chunk_scroll.winfo_children():
-            w.destroy()
-
-        if not results:
-            ctk.CTkLabel(
-                self.mem_chunk_scroll,
-                text=f'No memories surfaced for: "{query_text}"',
-                font=ctk.CTkFont(size=10),
-                text_color="#666666",
-            ).pack(anchor="w", padx=4, pady=8)
-            return
-
-        # Header showing this is a test result view
-        ctk.CTkLabel(
-            self.mem_chunk_scroll,
-            text=f'Test results for: "{query_text[:50]}" — click a filter to return',
-            font=ctk.CTkFont(size=10),
-            text_color="#FFC107",
-        ).pack(anchor="w", padx=4, pady=(4, 2))
-
-        for i, chunk_text in enumerate(results):
-            row = ctk.CTkFrame(
-                self.mem_chunk_scroll,
-                fg_color="#111100",
-                corner_radius=3,
-                border_color="#FFC107",
-                border_width=1,
-            )
-            row.pack(fill="x", pady=2, padx=2)
-
-            ctk.CTkLabel(
-                row,
-                text=f"#{i+1}",
-                font=ctk.CTkFont(size=9, weight="bold"),
-                text_color="#FFC107",
-                width=24,
-                anchor="w",
-            ).pack(side="left", padx=(5, 0), pady=4)
-
-            preview = chunk_text[:120].replace("\n", " ")
-            row_label = ctk.CTkLabel(
-                row,
-                text=preview,
-                font=ctk.CTkFont(size=10),
-                text_color="#cccc88",
-                anchor="w",
-                justify="left",
-            )
-            row_label.pack(side="left", fill="x", expand=True, padx=(4, 6), pady=4)
-
-            # Expand on click
-            def make_toggle(lbl, short, full):
-                state = {"expanded": False}
-                def toggle(event=None):
-                    if state["expanded"]:
-                        lbl.configure(text=short, wraplength=0)
-                        state["expanded"] = False
-                    else:
-                        lbl.configure(text=full, wraplength=400)
-                        state["expanded"] = True
-                return toggle
-            row_label.bind("<Button-1>", make_toggle(row_label, preview, chunk_text))
-            row.bind("<Button-1>", make_toggle(row_label, preview, chunk_text))
+    def _update_injected_display(self, text: str):
+        self.easy_injected.configure(state="normal")
+        self.easy_injected.delete("1.0", tk.END)
+        self.easy_injected.insert(tk.END, text)
+        self.easy_injected.configure(state="disabled")
 
     def set_interlocutor(self, plain: str):
         self.current_interlocutor = plain
