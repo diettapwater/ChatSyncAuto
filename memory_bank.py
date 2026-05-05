@@ -12,34 +12,67 @@ No API key needed — fully local.
 from pathlib import Path
 import json
 import re
+import sys
 
 _db         = None
 _collection = None
-_DB_PATH    = Path(__file__).parent / "memory_bank_db"
+_last_error = None   # stores traceback string from last _get_collection() failure
+# When running as a PyInstaller onefile exe, __file__ points to the temp
+# extraction folder which gets wiped on exit. Use the exe's own directory
+# so the database persists between launches.
+if getattr(sys, 'frozen', False):
+    _DB_PATH = Path(sys.executable).parent / "memory_bank_db"
+    _lib = Path(sys.executable).parent / "lib"
+    if _lib.is_dir():
+        sys.path.insert(0, str(_lib))
+else:
+    _DB_PATH = Path(__file__).parent / "memory_bank_db"
 
 _COLLECTION_NAME = "npc_memories"
 
 
 def _get_collection():
-    global _db, _collection
+    global _db, _collection, _last_error
     if _collection is not None:
         return _collection
     try:
         import chromadb
+        _DB_PATH.mkdir(parents=True, exist_ok=True)
         _db = chromadb.PersistentClient(path=str(_DB_PATH))
         _collection = _db.get_or_create_collection(
             name=_COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
+        _last_error = None
         return _collection
     except Exception as e:
-        print(f"[MemoryBank] ChromaDB unavailable: {e}")
+        import traceback, datetime
+        _last_error = traceback.format_exc()
+        msg = f"[MemoryBank] ChromaDB unavailable: {e}"
+        print(msg)
+        # Try multiple log locations in order — Steam dir may be write-protected
+        for log_path in [
+            _DB_PATH.parent / "memory_bank_error.log",
+            Path.home() / "memory_bank_error.log",
+        ]:
+            try:
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n--- {datetime.datetime.now()} ---\n")
+                    f.write(_last_error)
+                break
+            except Exception:
+                continue
         return None
 
 
 def is_available() -> bool:
     """Return True if ChromaDB is installed and the collection is accessible."""
     return _get_collection() is not None
+
+
+def get_last_error() -> str:
+    """Return the traceback from the last failed _get_collection() call, or ''."""
+    return _last_error or ""
 
 
 # ---------------------------------------------------------------------------
