@@ -92,6 +92,15 @@ DEFAULT_REPLY_WAIT, DEFAULT_REPLY_TIMEOUT, DEFAULT_DEBOUNCE, DEDUP_TAIL_CHECK = 
 _MEM_PREAMBLE_START = "\n\n--- PAST MEMORIES (ChatSyncAuto) ---\n"
 _MEM_PREAMBLE_END = "\n--- END PAST MEMORIES ---"
 PRESET_FILE = "ChatSyncAuto_presets.json"
+PERSONA_FIELDS = (
+    "CharacterDescription",
+    "AIGeneratedPersonality",
+    "AIGeneratedBackstory",
+    "AIGeneratedSpeechQuirks",
+)
+# After this many seconds with no new ConversationHistory lines, strip injected memory
+# preamble from AIGeneratedBackstory (0 = never strip automatically).
+DEFAULT_MEMORY_PREAMBLE_STRIP_IDLE_SEC = 90
 ctk.set_default_color_theme("blue")
 
 # --- Helper Functions ---
@@ -264,6 +273,8 @@ class AutoEngine:
         if not isinstance(ch, list): ch = []
         prev_len = self.last_len.get(p, 0)
         cur_len = len(ch)
+        if cur_len > prev_len:
+            self.app._schedule_strip_memory_preamble(p)
         npc_plain = extract_character_name(d, p.stem) or self.app.path_to_plain.get(p, normalize_display_name(p.stem))
         last_milestone = self.auto_archived_milestones.get(p, 0)
         
@@ -320,7 +331,14 @@ class AutoEngine:
                 p_text = pend.player_entry.get("Text", str(pend.player_entry)) if isinstance(pend.player_entry, dict) else (re.match(r"^\s*[^:\n\r]+\s*:\s*(.*)", pend.player_entry).group(1) if re.match(r"^\s*[^:\n\r]+\s*:\s*(.*)", pend.player_entry) else pend.player_entry) if isinstance(pend.player_entry, str) else ""
                 p_text = p_text.strip()
                 is_director_prompt = False
-                if self.app.smart_filter_prompts.get() and ((p_text.startswith("(") and p_text.endswith(")")) or "(continue)" in p_text.lower()): is_director_prompt = True
+                if self.app.smart_filter_prompts.get():
+                    p_text_l = p_text.lower()
+                    is_director_prompt = (
+                        (p_text.startswith("(") and p_text.endswith(")"))
+                        or "(continue)" in p_text_l
+                        or "[ooc:" in p_text_l
+                        or "@" in p_text
+                    )
 
                 if self.app.mirror_npc_only.get() or is_director_prompt:
                     if is_director_prompt and not self.app.mirror_npc_only.get(): self.app.log(f"[Smart Filter] Ignored player OOC prompt.")
@@ -369,6 +387,8 @@ class AutoEngine:
                                 is_ooc = self.app.smart_filter_prompts.get() and (
                                     (p_text.strip().startswith("(") and p_text.strip().endswith(")"))
                                     or "(continue)" in p_text.lower()
+                                    or "[ooc:" in p_text.lower()
+                                    or "@" in p_text
                                 )
                                 if not is_ooc:
                                     entries_to_mirror = [prev_e, incoming]
@@ -488,6 +508,7 @@ class ChatSyncAutoApp(ctk.CTk):
         self._current_memory_npc: str = ""         # last NPC shown in Memory tab
         self.display_to_plain: Dict[str, str] = {} # display_name -> npc_plain (ChromaDB key)
         self._mem_tab_after_id = None              # debounce handle for memory tab refresh
+        self._preamble_strip_after_ids: Dict[str, Any] = {}  # path key -> tk after id
 
         self.auto_archive_enabled.trace_add("write", self._save_settings_trigger)
         self.auto_archive_threshold_var.trace_add("write", self._save_settings_trigger)
@@ -893,6 +914,43 @@ class ChatSyncAutoApp(ctk.CTk):
         self.easy_scroll = ctk.CTkScrollableFrame(self.tab_easy, fg_color="transparent")
         self.easy_scroll.pack(fill="both", expand=True)
 
+        persona_btn_frame = ctk.CTkFrame(self.easy_scroll, fg_color="transparent")
+        persona_btn_frame.pack(fill="x", pady=(0, 8))
+        ctk.CTkButton(
+            persona_btn_frame,
+            text="Export Character Persona",
+            width=180,
+            fg_color="#2a5298",
+            hover_color="#1a3a7a",
+            command=self._export_character_persona,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            persona_btn_frame,
+            text="Import Character Persona",
+            width=180,
+            fg_color="#2e7d32",
+            hover_color="#1b5e20",
+            command=self._import_character_persona,
+        ).pack(side="left")
+        bundle_btn_frame = ctk.CTkFrame(self.easy_scroll, fg_color="transparent")
+        bundle_btn_frame.pack(fill="x", pady=(0, 10))
+        ctk.CTkButton(
+            bundle_btn_frame,
+            text="Export Character Backup Bundle",
+            width=220,
+            fg_color="#1f4f7a",
+            hover_color="#173a59",
+            command=self._export_character_backup_bundle,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            bundle_btn_frame,
+            text="Import Character Backup Bundle",
+            width=220,
+            fg_color="#1f7a4f",
+            hover_color="#17593a",
+            command=self._import_character_backup_bundle,
+        ).pack(side="left")
+
         ctk.CTkLabel(self.easy_scroll, text="Character Description (Core Personality)", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 2))
         self.easy_char_desc = ctk.CTkTextbox(self.easy_scroll, height=100, wrap="word", undo=True)
         self.easy_char_desc.pack(fill="x", pady=(0, 15))
@@ -982,6 +1040,24 @@ class ChatSyncAutoApp(ctk.CTk):
         self.history_text = ctk.CTkTextbox(self.tab_history, wrap="none", undo=True)
         self.history_text.pack(fill="both", expand=True, pady=(0, 5))
         self.history_text.bind("<KeyRelease>", self._check_history_syntax)
+        history_btn_frame = ctk.CTkFrame(self.tab_history, fg_color="transparent")
+        history_btn_frame.pack(fill="x", pady=(0, 6))
+        ctk.CTkButton(
+            history_btn_frame,
+            text="Export Conversation History",
+            width=200,
+            fg_color="#2a5298",
+            hover_color="#1a3a7a",
+            command=self._export_conversation_history,
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            history_btn_frame,
+            text="Import Conversation History",
+            width=200,
+            fg_color="#2e7d32",
+            hover_color="#1b5e20",
+            command=self._import_conversation_history,
+        ).pack(side="left")
 
         # --- NARRATOR INPUT STRIP ---
         narrator_frame = ctk.CTkFrame(self.tab_history, fg_color="#1a1a2e", corner_radius=6)
@@ -2041,6 +2117,241 @@ class ChatSyncAutoApp(ctk.CTk):
 
         threading.Thread(target=_bg_index, daemon=True).start()
 
+    def _export_character_persona(self):
+        if not self.currently_editing_path:
+            self.log("[Persona] Select an NPC first.")
+            return
+        data = safe_load_json(self.currently_editing_path)
+        if not data:
+            self.log("[Persona] Could not read selected NPC JSON.")
+            return
+        npc_plain = extract_character_name(data or {}, self.currently_editing_path.stem) or normalize_display_name(self.currently_editing_path.stem)
+        out = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=f"{npc_plain}_persona.json",
+            filetypes=[("ChatSyncAuto Persona", "*.json"), ("All files", "*.*")],
+            title="Export Character Persona",
+        )
+        if not out:
+            return
+        export_data = {
+            "chatsyncauto_persona_export": True,
+            "source_character": npc_plain,
+            "fields": {k: data.get(k) for k in PERSONA_FIELDS},
+        }
+        if safe_write_json(Path(out), export_data):
+            self.log(f"[Persona] Exported persona fields from {npc_plain} → {Path(out).name}")
+        else:
+            self.log("[Persona] Export failed.")
+
+    def _import_character_persona(self):
+        if not self.currently_editing_path:
+            self.log("[Persona] Select a target NPC first.")
+            return
+        target_data = safe_load_json(self.currently_editing_path)
+        if not target_data:
+            self.log("[Persona] Could not read target NPC JSON.")
+            return
+        target_name = extract_character_name(target_data or {}, self.currently_editing_path.stem) or normalize_display_name(self.currently_editing_path.stem)
+        src = filedialog.askopenfilename(
+            filetypes=[("ChatSyncAuto Persona", "*.json"), ("All files", "*.*")],
+            title=f"Import Character Persona → {target_name}",
+        )
+        if not src:
+            return
+        import_data = safe_load_json(Path(src))
+        if not import_data:
+            self.log("[Persona] Invalid file.")
+            return
+
+        raw_fields = import_data.get("fields", import_data)
+        if not isinstance(raw_fields, dict):
+            self.log("[Persona] Invalid file format — missing persona fields.")
+            return
+        has_any_field = any(k in raw_fields for k in PERSONA_FIELDS)
+        if not has_any_field:
+            self.log("[Persona] File has no supported persona fields.")
+            return
+
+        old_text = self.currently_editing_path.read_text(encoding="utf-8")
+        for key in PERSONA_FIELDS:
+            if key in raw_fields:
+                target_data[key] = raw_fields.get(key)
+
+        if safe_write_json(self.currently_editing_path, target_data):
+            source_name = import_data.get("source_character", Path(src).stem)
+            self._push_undo_group(
+                f"Import Persona into {self.currently_editing_path.stem}",
+                [(self.currently_editing_path, old_text)],
+            )
+            self.log(f"[Persona] Imported persona fields from {source_name} into {target_name}.")
+            self._refresh_json_editor()
+        else:
+            self.log("[Persona] Failed to import persona file.")
+
+    def _export_conversation_history(self):
+        if not self.currently_editing_path:
+            self.log("[History] Select an NPC first.")
+            return
+        data = safe_load_json(self.currently_editing_path)
+        if not data:
+            self.log("[History] Could not read selected NPC JSON.")
+            return
+        history = data.get("ConversationHistory")
+        if not isinstance(history, list):
+            self.log("[History] Selected NPC has no valid ConversationHistory array.")
+            return
+        npc_plain = extract_character_name(data or {}, self.currently_editing_path.stem) or normalize_display_name(self.currently_editing_path.stem)
+        out = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=f"{npc_plain}_history.json",
+            filetypes=[("ChatSyncAuto History", "*.json"), ("All files", "*.*")],
+            title="Export Conversation History",
+        )
+        if not out:
+            return
+        export_data = {
+            "chatsyncauto_history_export": True,
+            "source_character": npc_plain,
+            "message_count": len(history),
+            "conversation_history": history,
+        }
+        if safe_write_json(Path(out), export_data):
+            self.log(f"[History] Exported {len(history)} message(s) from {npc_plain} → {Path(out).name}")
+        else:
+            self.log("[History] Export failed.")
+
+    def _import_conversation_history(self):
+        if not self.currently_editing_path:
+            self.log("[History] Select a target NPC first.")
+            return
+        data = safe_load_json(self.currently_editing_path)
+        if not data:
+            self.log("[History] Could not read target NPC JSON.")
+            return
+        target_name = extract_character_name(data or {}, self.currently_editing_path.stem) or normalize_display_name(self.currently_editing_path.stem)
+        src = filedialog.askopenfilename(
+            filetypes=[("ChatSyncAuto History", "*.json"), ("All files", "*.*")],
+            title=f"Import Conversation History → {target_name}",
+        )
+        if not src:
+            return
+        import_data = safe_load_json(Path(src))
+        if import_data is None:
+            self.log("[History] Invalid file.")
+            return
+        if isinstance(import_data, dict):
+            imported_history = import_data.get("conversation_history")
+            if not isinstance(imported_history, list):
+                self.log("[History] Invalid file format — missing conversation history array.")
+                return
+        elif isinstance(import_data, list):
+            # Backward compatibility: allow raw array files.
+            imported_history = import_data
+        else:
+            self.log("[History] Invalid file format.")
+            return
+
+        old_text = self.currently_editing_path.read_text(encoding="utf-8")
+        data["ConversationHistory"] = imported_history
+        self._clear_mod_caches(data)
+        if safe_write_json(self.currently_editing_path, data):
+            source_name = import_data.get("source_character", Path(src).stem) if isinstance(import_data, dict) else Path(src).stem
+            self._push_undo_group(
+                f"Import History into {self.currently_editing_path.stem}",
+                [(self.currently_editing_path, old_text)],
+            )
+            self._write_sync_trigger(self.currently_editing_path)
+            self.log(f"[History] Imported {len(imported_history)} message(s) from {source_name} into {target_name}.")
+            self._refresh_json_editor()
+        else:
+            self.log("[History] Failed to import conversation history.")
+
+    def _export_character_backup_bundle(self):
+        if not self.currently_editing_path:
+            self.log("[Bundle] Select an NPC first.")
+            return
+        data = safe_load_json(self.currently_editing_path)
+        if not isinstance(data, dict):
+            self.log("[Bundle] Could not read selected NPC JSON.")
+            return
+        npc_plain = extract_character_name(data, self.currently_editing_path.stem) or normalize_display_name(self.currently_editing_path.stem)
+        history = data.get("ConversationHistory")
+        if not isinstance(history, list):
+            self.log("[Bundle] Selected NPC has no valid ConversationHistory array.")
+            return
+        out = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=f"{npc_plain}_backup_bundle.json",
+            filetypes=[("ChatSyncAuto Backup Bundle", "*.json"), ("All files", "*.*")],
+            title="Export Character Backup Bundle",
+        )
+        if not out:
+            return
+        export_data = {
+            "chatsyncauto_character_backup_bundle": True,
+            "source_character": npc_plain,
+            "created_unix": int(time.time()),
+            "persona_fields": {k: data.get(k) for k in PERSONA_FIELDS},
+            "message_count": len(history),
+            "conversation_history": history,
+        }
+        if safe_write_json(Path(out), export_data):
+            self.log(f"[Bundle] Exported backup bundle for {npc_plain} ({len(history)} message(s)) → {Path(out).name}")
+        else:
+            self.log("[Bundle] Export failed.")
+
+    def _import_character_backup_bundle(self):
+        if not self.currently_editing_path:
+            self.log("[Bundle] Select a target NPC first.")
+            return
+        target_data = safe_load_json(self.currently_editing_path)
+        if not isinstance(target_data, dict):
+            self.log("[Bundle] Could not read target NPC JSON.")
+            return
+        target_name = extract_character_name(target_data, self.currently_editing_path.stem) or normalize_display_name(self.currently_editing_path.stem)
+        src = filedialog.askopenfilename(
+            filetypes=[("ChatSyncAuto Backup Bundle", "*.json"), ("All files", "*.*")],
+            title=f"Import Character Backup Bundle → {target_name}",
+        )
+        if not src:
+            return
+        import_data = safe_load_json(Path(src))
+        if not isinstance(import_data, dict):
+            self.log("[Bundle] Invalid bundle file.")
+            return
+        raw_fields = import_data.get("persona_fields")
+        imported_history = import_data.get("conversation_history")
+        if not isinstance(raw_fields, dict):
+            self.log("[Bundle] Invalid bundle — missing persona_fields.")
+            return
+        if not isinstance(imported_history, list):
+            self.log("[Bundle] Invalid bundle — missing conversation_history array.")
+            return
+        has_any_field = any(k in raw_fields for k in PERSONA_FIELDS)
+        if not has_any_field:
+            self.log("[Bundle] Bundle has no supported persona fields.")
+            return
+
+        old_text = self.currently_editing_path.read_text(encoding="utf-8")
+        for key in PERSONA_FIELDS:
+            if key in raw_fields:
+                target_data[key] = raw_fields.get(key)
+        target_data["ConversationHistory"] = imported_history
+        self._clear_mod_caches(target_data)
+
+        if safe_write_json(self.currently_editing_path, target_data):
+            source_name = import_data.get("source_character", Path(src).stem)
+            self._push_undo_group(
+                f"Import Backup Bundle into {self.currently_editing_path.stem}",
+                [(self.currently_editing_path, old_text)],
+            )
+            self._write_sync_trigger(self.currently_editing_path)
+            self.log(f"[Bundle] Imported bundle from {source_name} into {target_name} ({len(imported_history)} message(s)).")
+            self._refresh_json_editor()
+        else:
+            self.log("[Bundle] Failed to import backup bundle.")
+
     def _rebuild_lore_library(self):
         self.lore_char_list.delete(0, tk.END)
         self.lore_chapter_combo.set("Select Chapter...")
@@ -2212,6 +2523,7 @@ class ChatSyncAutoApp(ctk.CTk):
             self.display_to_plain[display] = npc_plain
         valid = {d for d, _ in chars}
         self.scene_members = {d for d in self.scene_members if d in valid}
+        self._cancel_all_preamble_strip_timers()
         self.engine.set_files([p for _, p in chars])
         self._rebuild_all_list()
         self._rebuild_scene_list()
@@ -2513,6 +2825,67 @@ class ChatSyncAutoApp(ctk.CTk):
 
         threading.Thread(target=_bg, daemon=True).start()
 
+    def _cancel_all_preamble_strip_timers(self):
+        for aid in list(self._preamble_strip_after_ids.values()):
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
+        self._preamble_strip_after_ids.clear()
+
+    def _schedule_strip_memory_preamble(self, path: Path):
+        """After idle (no new ConversationHistory lines), remove injected preamble from disk.
+
+        Does not call _write_sync_trigger — same rationale as inject (AI Influence reads at talk).
+        """
+        try:
+            delay_sec = int(self.presets.get("memory_preamble_strip_idle_sec", DEFAULT_MEMORY_PREAMBLE_STRIP_IDLE_SEC))
+        except (TypeError, ValueError):
+            delay_sec = DEFAULT_MEMORY_PREAMBLE_STRIP_IDLE_SEC
+        if delay_sec <= 0:
+            return
+        delay_sec = min(max(delay_sec, 15), 3600)
+        key = str(path.resolve())
+        old_id = self._preamble_strip_after_ids.pop(key, None)
+        if old_id is not None:
+            try:
+                self.after_cancel(old_id)
+            except Exception:
+                pass
+
+        def _run():
+            self._preamble_strip_after_ids.pop(key, None)
+            self._strip_memory_preamble_from_file(path)
+
+        self._preamble_strip_after_ids[key] = self.after(delay_sec * 1000, _run)
+
+    def _strip_memory_preamble_from_file(self, path: Path):
+        try:
+            data = safe_load_json(path)
+            if not isinstance(data, dict):
+                return
+            backstory = data.get("AIGeneratedBackstory") or ""
+            if _MEM_PREAMBLE_START not in backstory:
+                return
+            start = backstory.find(_MEM_PREAMBLE_START)
+            if start == -1:
+                return
+            end = backstory.find(_MEM_PREAMBLE_END, start)
+            if end != -1:
+                new_bs = (backstory[:start] + backstory[end + len(_MEM_PREAMBLE_END):]).rstrip()
+            else:
+                new_bs = backstory[:start].rstrip()
+            data["AIGeneratedBackstory"] = new_bs if new_bs else None
+            npc_plain = extract_character_name(data, path.stem) or self.path_to_plain.get(path, path.stem)
+            if safe_write_json(path, data):
+                if hasattr(self, "_inject_cooldowns") and npc_plain:
+                    self._inject_cooldowns.pop(npc_plain, None)
+                self.log(f"[Memory] Removed idle memory preamble from {npc_plain}'s backstory (keeps JSON lean).")
+                if self.currently_editing_path and path.resolve() == self.currently_editing_path.resolve():
+                    self.after(0, self._refresh_json_editor)
+        except Exception as exc:
+            self.log(f"[Memory] Preamble strip failed: {exc}")
+
     def _inject_memory_preamble(self, npc_plain: str, path: Path):
         """Proactively write top ChromaDB memories into AIGeneratedBackstory.
 
@@ -2561,6 +2934,7 @@ class ChatSyncAutoApp(ctk.CTk):
                     f"[Memory] Injected {c} chunk(s) into {n}'s backstory."
                 ))
                 self.after(0, lambda bc=block_content: self._update_injected_display(bc))
+                self.after(0, lambda p=path: self._schedule_strip_memory_preamble(p))
         except Exception as exc:
             self.after(0, lambda e=exc: self.log(f"[Memory] Preamble inject failed: {e}"))
 
